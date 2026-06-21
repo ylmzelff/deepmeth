@@ -31,22 +31,32 @@ NUMERIC_COLUMNS = [
 ]
 
 DEFAULT_INPUT_DIR = Path("/content/deepmeth/data/raw/GSE65364/extracted")
-DEFAULT_OUTPUT_DIR = Path(
-    "/content/drive/MyDrive/1001_BioSeq_LLM/"
-    "deepmeth_backup/GSE65364/all_cells_analysis"
-)
+DEFAULT_OUTPUT_DIR = Path("/content/deepmeth/data/wp5_1/analysis")
+DEFAULT_PATTERN = "*_Ca_*_RRBS.single.CpG.txt.gz"
+
+FIRST_HCC_CELL = 1
+LAST_HCC_CELL = 25
 
 
 def infer_cell_id(path: Path) -> str:
-    """Extract Ca_01 ... Ca_26 from the filename."""
+    """Extract a cell identifier such as Ca_01 from a filename."""
     match = re.search(r"(Ca_\d{2})", path.name)
     if match is None:
         raise ValueError(f"Cell ID could not be inferred from: {path.name}")
     return match.group(1)
 
 
+def cell_number(cell_id: str) -> int:
+    return int(cell_id.split("_")[1])
+
+
+def is_wp51_hcc_cell(cell_id: str) -> bool:
+    number = cell_number(cell_id)
+    return FIRST_HCC_CELL <= number <= LAST_HCC_CELL
+
+
 def load_raw_file(path: Path) -> pd.DataFrame:
-    """Load and validate one GSE65364 RRBS file."""
+    """Load and validate one GSE65364 scRRBS file."""
     df = pd.read_csv(
         path,
         sep="\t",
@@ -55,17 +65,20 @@ def load_raw_file(path: Path) -> pd.DataFrame:
         compression="gzip",
     )
 
+    if df.empty:
+        raise ValueError(f"{path.name}: file is empty.")
+
     df[NUMERIC_COLUMNS] = df[NUMERIC_COLUMNS].apply(
         pd.to_numeric,
         errors="coerce",
     )
 
     if df[NUMERIC_COLUMNS].isna().any().any():
-        columns = df[NUMERIC_COLUMNS].columns[
+        invalid_columns = df[NUMERIC_COLUMNS].columns[
             df[NUMERIC_COLUMNS].isna().any()
         ].tolist()
         raise ValueError(
-            f"{path.name}: missing or non-numeric values in {columns}"
+            f"{path.name}: missing or non-numeric values in {invalid_columns}"
         )
 
     df["base"] = df["base"].astype(str).str.upper().str.strip()
@@ -91,10 +104,12 @@ def load_raw_file(path: Path) -> pd.DataFrame:
     return df
 
 
-def build_merged_method(
-    raw_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Canonical strand merge: C/+ -> p and G/- -> p - 1."""
+def build_wp51_dataset(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply the WP5.1 canonical strand merge and binary-label rule.
+
+    Ties are retained and assigned label 0.
+    """
     strand_df = raw_df.copy()
 
     strand_df["canonical_position"] = np.where(
@@ -125,6 +140,8 @@ def build_merged_method(
         )
     )
 
+    merged_df["count_m"] = merged_df["count_m"].astype("int64")
+    merged_df["count_u"] = merged_df["count_u"].astype("int64")
     merged_df["coverage"] = merged_df["count_m"] + merged_df["count_u"]
     merged_df["methylation_ratio"] = (
         merged_df["count_m"] / merged_df["coverage"].replace(0, np.nan)
@@ -145,59 +162,26 @@ def build_merged_method(
         default="Unexpected",
     )
 
-    tie_mask = merged_df["count_m"].eq(merged_df["count_u"])
-    tie_df = merged_df.loc[tie_mask].copy().reset_index(drop=True)
-
-    labeled_df = merged_df.loc[~tie_mask].copy().reset_index(drop=True)
-    labeled_df["label"] = (
-        labeled_df["count_m"].gt(labeled_df["count_u"]).astype("int8")
+    merged_df["is_tie"] = (
+        merged_df["count_m"].eq(merged_df["count_u"]).astype("int8")
     )
-    labeled_df["methylation_state"] = labeled_df["label"].map(
+    merged_df["label"] = (
+        merged_df["count_m"].gt(merged_df["count_u"]).astype("int8")
+    )
+    merged_df["methylation_state"] = merged_df["label"].map(
         {0: "Unmethylated", 1: "Methylated"}
     )
 
-    return merged_df, labeled_df, tie_df
+    if int(merged_df["count_m"].sum()) != int(raw_df["count_m"].sum()):
+        raise RuntimeError("Methylated-read total changed during merging.")
+    if int(merged_df["count_u"].sum()) != int(raw_df["count_u"].sum()):
+        raise RuntimeError("Unmethylated-read total changed during merging.")
+    if merged_df.duplicated(["chrom", "canonical_position"]).any():
+        raise RuntimeError("Duplicated canonical CpG coordinates remain.")
+    if not merged_df.loc[merged_df["is_tie"].eq(1), "label"].eq(0).all():
+        raise RuntimeError("Tie records must have label 0.")
 
-
-def build_c_plus_method(
-    raw_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Sensitivity method using only C/+ records."""
-    c_plus_df = raw_df.loc[
-        raw_df["representation"].eq("C/+")
-    ].copy()
-
-    c_plus_df = (
-        c_plus_df.groupby(
-            ["chrom", "position"],
-            as_index=False,
-            sort=False,
-        )
-        .agg(
-            raw_record_count=("position", "size"),
-            count_m=("count_m", "sum"),
-            count_u=("count_u", "sum"),
-        )
-        .rename(columns={"position": "canonical_position"})
-    )
-
-    c_plus_df["coverage"] = c_plus_df["count_m"] + c_plus_df["count_u"]
-    c_plus_df["methylation_ratio"] = (
-        c_plus_df["count_m"] / c_plus_df["coverage"].replace(0, np.nan)
-    )
-
-    tie_mask = c_plus_df["count_m"].eq(c_plus_df["count_u"])
-    tie_df = c_plus_df.loc[tie_mask].copy().reset_index(drop=True)
-
-    labeled_df = c_plus_df.loc[~tie_mask].copy().reset_index(drop=True)
-    labeled_df["label"] = (
-        labeled_df["count_m"].gt(labeled_df["count_u"]).astype("int8")
-    )
-    labeled_df["methylation_state"] = labeled_df["label"].map(
-        {0: "Unmethylated", 1: "Methylated"}
-    )
-
-    return labeled_df, tie_df
+    return merged_df
 
 
 def save_table(df: pd.DataFrame, path: Path) -> None:
@@ -212,18 +196,18 @@ def save_figure(fig: plt.Figure, path: Path) -> None:
     plt.close(fig)
 
 
-def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | str]:
-    """Run all exploratory checks for one cell and save its results."""
+def analyze_cell(
+    raw_path: Path,
+    output_root: Path,
+) -> dict[str, float | int | str]:
+    """Run WP5.1 exploratory analysis for one HCC cell."""
     cell_id = infer_cell_id(raw_path)
     cell_dir = output_root / cell_id
     tables_dir = cell_dir / "tables"
     figures_dir = cell_dir / "figures"
 
     raw_df = load_raw_file(raw_path)
-    merged_all_df, merged_labeled_df, merged_tie_df = build_merged_method(
-        raw_df
-    )
-    c_plus_labeled_df, c_plus_tie_df = build_c_plus_method(raw_df)
+    processed_df = build_wp51_dataset(raw_df)
 
     representation_counts = (
         raw_df["representation"]
@@ -275,13 +259,13 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
     save_table(raw_qc_summary, tables_dir / "02_raw_qc_summary.csv")
 
     strand_support_counts = (
-        merged_all_df["strand_support"]
+        processed_df["strand_support"]
         .value_counts()
         .rename_axis("Strand Support")
         .reset_index(name="CpG Count")
     )
     strand_support_counts["Percentage"] = (
-        strand_support_counts["CpG Count"] / len(merged_all_df) * 100
+        strand_support_counts["CpG Count"] / len(processed_df) * 100
     ).round(2)
     save_table(
         strand_support_counts,
@@ -307,12 +291,12 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
                 raw_df["methylation_ratio"].median(),
             ],
             "After Merging": [
-                len(merged_all_df),
-                merged_all_df["coverage"].mean(),
-                merged_all_df["coverage"].median(),
-                merged_all_df["coverage"].max(),
-                merged_all_df["methylation_ratio"].mean(),
-                merged_all_df["methylation_ratio"].median(),
+                len(processed_df),
+                processed_df["coverage"].mean(),
+                processed_df["coverage"].median(),
+                processed_df["coverage"].max(),
+                processed_df["methylation_ratio"].mean(),
+                processed_df["methylation_ratio"].median(),
             ],
         }
     )
@@ -321,148 +305,56 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
         tables_dir / "04_pre_post_merge_summary.csv",
     )
 
-    method_comparison = pd.DataFrame(
-        {
-            "Method": [
-                "Method 1: Merged strands",
-                "Method 2: C/+ only",
-            ],
-            "Labeled CpG Count": [
-                len(merged_labeled_df),
-                len(c_plus_labeled_df),
-            ],
-            "Unmethylated Count": [
-                int(merged_labeled_df["label"].eq(0).sum()),
-                int(c_plus_labeled_df["label"].eq(0).sum()),
-            ],
-            "Methylated Count": [
-                int(merged_labeled_df["label"].eq(1).sum()),
-                int(c_plus_labeled_df["label"].eq(1).sum()),
-            ],
-            "Mean Coverage": [
-                merged_labeled_df["coverage"].mean(),
-                c_plus_labeled_df["coverage"].mean(),
-            ],
-            "Median Coverage": [
-                merged_labeled_df["coverage"].median(),
-                c_plus_labeled_df["coverage"].median(),
-            ],
-        }
+    label_distribution = (
+        processed_df.groupby(
+            ["label", "methylation_state"],
+            as_index=False,
+        )
+        .agg(CpG_Count=("canonical_position", "size"))
     )
-    method_comparison["Methylated Percentage"] = (
-        method_comparison["Methylated Count"]
-        / method_comparison["Labeled CpG Count"]
-        * 100
+    label_distribution["Percentage"] = (
+        label_distribution["CpG_Count"] / len(processed_df) * 100
     ).round(2)
     save_table(
-        method_comparison,
-        tables_dir / "05_method_comparison.csv",
+        label_distribution,
+        tables_dir / "05_label_distribution.csv",
     )
 
-    common_df = merged_labeled_df[
-        [
-            "chrom",
-            "canonical_position",
-            "coverage",
-            "methylation_ratio",
-            "label",
-        ]
-    ].rename(
-        columns={
-            "coverage": "merged_coverage",
-            "methylation_ratio": "merged_ratio",
-            "label": "merged_label",
-        }
-    ).merge(
-        c_plus_labeled_df[
-            [
-                "chrom",
-                "canonical_position",
-                "coverage",
-                "methylation_ratio",
-                "label",
-            ]
-        ].rename(
-            columns={
-                "coverage": "c_plus_coverage",
-                "methylation_ratio": "c_plus_ratio",
-                "label": "c_plus_label",
-            }
-        ),
-        on=["chrom", "canonical_position"],
-        how="inner",
-        validate="one_to_one",
-    )
-
-    common_df["same_label"] = (
-        common_df["merged_label"].eq(common_df["c_plus_label"])
-    )
-    common_df["coverage_gain"] = (
-        common_df["merged_coverage"] - common_df["c_plus_coverage"]
-    )
-    common_df["label_transition"] = (
-        common_df["c_plus_label"].astype(str)
-        + " -> "
-        + common_df["merged_label"].astype(str)
-    )
-
-    same_label_count = int(common_df["same_label"].sum())
-    label_agreement = (
-        same_label_count / len(common_df) * 100
-        if len(common_df)
-        else np.nan
-    )
-
-    common_summary = pd.DataFrame(
+    final_qc_summary = pd.DataFrame(
         {
             "Metric": [
-                "Common labeled CpGs",
-                "Common CpGs with same label",
-                "Common CpGs with different labels",
-                "Label agreement percentage",
+                "Physical CpG sites",
+                "Tie sites retained as label 0",
+                "Unmethylated CpGs",
+                "Methylated CpGs",
+                "Unmethylated percentage",
+                "Methylated percentage",
                 "Mean merged coverage",
-                "Mean C/+ coverage",
-                "Mean coverage gain",
-                "Common CpGs with additional G/- coverage",
+                "Median merged coverage",
+                "Maximum merged coverage",
+                "Duplicated canonical CpGs",
             ],
             "Value": [
-                len(common_df),
-                same_label_count,
-                int((~common_df["same_label"]).sum()),
-                label_agreement,
-                common_df["merged_coverage"].mean(),
-                common_df["c_plus_coverage"].mean(),
-                common_df["coverage_gain"].mean(),
-                int(common_df["coverage_gain"].gt(0).sum()),
+                len(processed_df),
+                int(processed_df["is_tie"].sum()),
+                int(processed_df["label"].eq(0).sum()),
+                int(processed_df["label"].eq(1).sum()),
+                processed_df["label"].eq(0).mean() * 100,
+                processed_df["label"].eq(1).mean() * 100,
+                processed_df["coverage"].mean(),
+                processed_df["coverage"].median(),
+                processed_df["coverage"].max(),
+                int(
+                    processed_df.duplicated(
+                        ["chrom", "canonical_position"]
+                    ).sum()
+                ),
             ],
         }
     )
-    save_table(
-        common_summary,
-        tables_dir / "06_common_cpg_summary.csv",
-    )
+    save_table(final_qc_summary, tables_dir / "06_final_qc_summary.csv")
 
-    label_transitions = (
-        common_df["label_transition"]
-        .value_counts()
-        .rename_axis("Label Transition")
-        .reset_index(name="CpG Count")
-    )
-    label_transitions["Percentage"] = (
-        label_transitions["CpG Count"] / len(common_df) * 100
-    ).round(4)
-    save_table(
-        label_transitions,
-        tables_dir / "07_label_transition_summary.csv",
-    )
-
-    changed_labels = common_df.loc[~common_df["same_label"]].copy()
-    save_table(
-        changed_labels,
-        tables_dir / "08_changed_label_cpg_sites.csv",
-    )
-
-    # Figure 1: base/strand representations
+    # Figure 1: raw base/strand representation.
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     bars = ax.bar(
         representation_counts["Representation"],
@@ -471,8 +363,8 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
     ax.bar_label(
         bars,
         labels=[
-            f"{count:,}\n({pct:.2f}%)"
-            for count, pct in zip(
+            f"{count:,}\n({percentage:.2f}%)"
+            for count, percentage in zip(
                 representation_counts["Record Count"],
                 representation_counts["Percentage"],
             )
@@ -485,7 +377,7 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
     ax.set_ylabel("Number of Raw Records")
     save_figure(fig, figures_dir / "01_representation_counts.png")
 
-    # Figure 2: raw coverage
+    # Figure 2: raw coverage distribution.
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
     ax.hist(np.log10(raw_df["coverage"] + 1), bins=60)
     ax.set_title(f"{cell_id}: Raw Coverage Distribution")
@@ -493,53 +385,63 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
     ax.set_ylabel("Number of Raw Records")
     save_figure(fig, figures_dir / "02_raw_coverage_distribution.png")
 
-    # Figure 3: methylated and unmethylated reads
-    count_m_log = np.log10(raw_df["count_m"] + 1)
-    count_u_log = np.log10(raw_df["count_u"] + 1)
+    # Figure 3: coverage before and after strand merging.
+    raw_log_coverage = np.log10(raw_df["coverage"] + 1)
+    merged_log_coverage = np.log10(processed_df["coverage"] + 1)
     bins = np.linspace(
-        min(count_m_log.min(), count_u_log.min()),
-        max(count_m_log.max(), count_u_log.max()),
+        min(raw_log_coverage.min(), merged_log_coverage.min()),
+        max(raw_log_coverage.max(), merged_log_coverage.max()),
         60,
     )
-    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
     ax.hist(
-        count_m_log,
+        raw_log_coverage,
         bins=bins,
+        density=True,
         histtype="step",
         linewidth=1.8,
-        label="Methylated reads",
+        label="Before merging",
     )
     ax.hist(
-        count_u_log,
+        merged_log_coverage,
         bins=bins,
+        density=True,
         histtype="step",
         linewidth=1.8,
-        label="Unmethylated reads",
+        label="After merging",
     )
-    ax.set_title(f"{cell_id}: Raw Read-Count Distributions")
-    ax.set_xlabel("Log10(1 + Read Count)")
-    ax.set_ylabel("Number of Raw Records")
+    ax.set_title(f"{cell_id}: Coverage Before and After Strand Merging")
+    ax.set_xlabel("Log10(1 + Coverage)")
+    ax.set_ylabel("Density")
     ax.legend(frameon=False)
-    save_figure(fig, figures_dir / "03_read_count_distributions.png")
+    save_figure(fig, figures_dir / "03_pre_post_coverage.png")
 
-    # Figure 4: coverage vs ratio
-    fig, ax = plt.subplots(figsize=(7.0, 5.0))
-    density = ax.hexbin(
-        np.log10(raw_df["coverage"].clip(lower=1)),
+    # Figure 4: methylation ratio before and after merging.
+    ratio_bins = np.linspace(0, 1, 51)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.hist(
         raw_df["methylation_ratio"],
-        gridsize=60,
-        mincnt=1,
-        bins="log",
+        bins=ratio_bins,
+        density=True,
+        histtype="step",
+        linewidth=1.8,
+        label="Before merging",
     )
-    ax.set_title(f"{cell_id}: Coverage vs. Methylation Ratio")
-    ax.set_xlabel("Log10 Coverage")
-    ax.set_ylabel("Methylation Ratio")
-    ax.set_ylim(0, 1)
-    colorbar = fig.colorbar(density, ax=ax)
-    colorbar.set_label("Log10 Number of Records")
-    save_figure(fig, figures_dir / "04_coverage_vs_ratio.png")
+    ax.hist(
+        processed_df["methylation_ratio"].dropna(),
+        bins=ratio_bins,
+        density=True,
+        histtype="step",
+        linewidth=1.8,
+        label="After merging",
+    )
+    ax.set_title(f"{cell_id}: Methylation Ratio Before and After Merging")
+    ax.set_xlabel("Methylation Ratio")
+    ax.set_ylabel("Density")
+    ax.legend(frameon=False)
+    save_figure(fig, figures_dir / "04_pre_post_ratio.png")
 
-    # Figure 5: strand support
+    # Figure 5: strand support.
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
     bars = ax.bar(
         strand_support_counts["Strand Support"],
@@ -548,8 +450,8 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
     ax.bar_label(
         bars,
         labels=[
-            f"{count:,}\n({pct:.2f}%)"
-            for count, pct in zip(
+            f"{count:,}\n({percentage:.2f}%)"
+            for count, percentage in zip(
                 strand_support_counts["CpG Count"],
                 strand_support_counts["Percentage"],
             )
@@ -563,145 +465,57 @@ def analyze_cell(raw_path: Path, output_root: Path) -> dict[str, float | int | s
     ax.tick_params(axis="x", rotation=12)
     save_figure(fig, figures_dir / "05_strand_support.png")
 
-    # Figure 6: coverage before/after merge
-    raw_log_cov = np.log10(raw_df["coverage"] + 1)
-    merged_log_cov = np.log10(merged_all_df["coverage"] + 1)
-    bins = np.linspace(
-        min(raw_log_cov.min(), merged_log_cov.min()),
-        max(raw_log_cov.max(), merged_log_cov.max()),
-        60,
-    )
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
-    ax.hist(
-        raw_log_cov,
-        bins=bins,
-        density=True,
-        histtype="step",
-        linewidth=1.8,
-        label="Before merging",
-    )
-    ax.hist(
-        merged_log_cov,
-        bins=bins,
-        density=True,
-        histtype="step",
-        linewidth=1.8,
-        label="After merging",
-    )
-    ax.set_title(f"{cell_id}: Coverage Before and After Merging")
-    ax.set_xlabel("Log10(1 + Coverage)")
-    ax.set_ylabel("Density")
-    ax.legend(frameon=False)
-    save_figure(fig, figures_dir / "06_pre_post_coverage.png")
-
-    # Figure 7: ratio before/after merge
-    ratio_bins = np.linspace(0, 1, 51)
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
-    ax.hist(
-        raw_df["methylation_ratio"],
-        bins=ratio_bins,
-        density=True,
-        histtype="step",
-        linewidth=1.8,
-        label="Before merging",
-    )
-    ax.hist(
-        merged_all_df["methylation_ratio"].dropna(),
-        bins=ratio_bins,
-        density=True,
-        histtype="step",
-        linewidth=1.8,
-        label="After merging",
-    )
-    ax.set_title(
-        f"{cell_id}: Methylation Ratio Before and After Merging"
-    )
-    ax.set_xlabel("Methylation Ratio")
-    ax.set_ylabel("Density")
-    ax.legend(frameon=False)
-    save_figure(fig, figures_dir / "07_pre_post_ratio.png")
-
-    # Figure 8: dataset size by method
-    fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    bars = ax.bar(
-        method_comparison["Method"],
-        method_comparison["Labeled CpG Count"],
-    )
-    ax.bar_label(
-        bars,
-        labels=[
-            f"{count:,}"
-            for count in method_comparison["Labeled CpG Count"]
-        ],
-        padding=3,
-    )
-    ax.set_title(f"{cell_id}: Dataset Size by Method")
-    ax.set_xlabel("Preprocessing Method")
-    ax.set_ylabel("Number of Labeled CpGs")
-    ax.tick_params(axis="x", rotation=10)
-    save_figure(fig, figures_dir / "08_method_dataset_size.png")
-
-    # Figure 9: label agreement
-    agreement_counts = pd.DataFrame(
-        {
-            "Agreement": ["Same label", "Different label"],
-            "CpG Count": [
-                same_label_count,
-                int((~common_df["same_label"]).sum()),
-            ],
-        }
-    )
+    # Figure 6: final binary label distribution.
     fig, ax = plt.subplots(figsize=(6.8, 4.8))
     bars = ax.bar(
-        agreement_counts["Agreement"],
-        agreement_counts["CpG Count"],
+        label_distribution["methylation_state"],
+        label_distribution["CpG_Count"],
     )
     ax.bar_label(
         bars,
         labels=[
-            f"{count:,}"
-            for count in agreement_counts["CpG Count"]
+            f"{count:,}\n({percentage:.2f}%)"
+            for count, percentage in zip(
+                label_distribution["CpG_Count"],
+                label_distribution["Percentage"],
+            )
         ],
         padding=3,
+        fontsize=9,
     )
-    ax.set_title(f"{cell_id}: Label Agreement Between Methods")
-    ax.set_xlabel("Agreement Status")
-    ax.set_ylabel("Number of Common CpGs")
-    save_figure(fig, figures_dir / "09_label_agreement.png")
+    ax.set_title(f"{cell_id}: WP5.1 Binary Label Distribution")
+    ax.set_xlabel("Methylation State")
+    ax.set_ylabel("Number of Physical CpG Sites")
+    save_figure(fig, figures_dir / "06_label_distribution.png")
 
     return {
         "cell_id": cell_id,
         "raw_records": len(raw_df),
         "c_plus_records": int(raw_df["representation"].eq("C/+").sum()),
         "g_minus_records": int(raw_df["representation"].eq("G/-").sum()),
-        "physical_cpgs": len(merged_all_df),
+        "physical_cpgs": len(processed_df),
         "both_strands": int(
-            merged_all_df["strand_support"]
-            .eq("Both C/+ and G/-")
-            .sum()
+            processed_df["strand_support"].eq("Both C/+ and G/-").sum()
         ),
         "c_plus_only": int(
-            merged_all_df["strand_support"].eq("C/+ only").sum()
+            processed_df["strand_support"].eq("C/+ only").sum()
         ),
         "g_minus_only": int(
-            merged_all_df["strand_support"].eq("G/- only").sum()
+            processed_df["strand_support"].eq("G/- only").sum()
         ),
-        "merged_ties": len(merged_tie_df),
-        "merged_labeled_cpgs": len(merged_labeled_df),
-        "c_plus_ties": len(c_plus_tie_df),
-        "c_plus_labeled_cpgs": len(c_plus_labeled_df),
-        "merged_methylated_percentage": round(
-            merged_labeled_df["label"].mean() * 100,
+        "ties_retained_as_label_0": int(processed_df["is_tie"].sum()),
+        "unmethylated_count": int(processed_df["label"].eq(0).sum()),
+        "methylated_count": int(processed_df["label"].eq(1).sum()),
+        "unmethylated_percentage": round(
+            processed_df["label"].eq(0).mean() * 100,
             4,
         ),
-        "c_plus_methylated_percentage": round(
-            c_plus_labeled_df["label"].mean() * 100,
+        "methylated_percentage": round(
+            processed_df["label"].eq(1).mean() * 100,
             4,
         ),
-        "common_labeled_cpgs": len(common_df),
-        "label_agreement_percentage": round(label_agreement, 4),
-        "mean_merged_coverage": merged_labeled_df["coverage"].mean(),
-        "mean_c_plus_coverage": c_plus_labeled_df["coverage"].mean(),
+        "mean_merged_coverage": float(processed_df["coverage"].mean()),
+        "median_merged_coverage": float(processed_df["coverage"].median()),
     }
 
 
@@ -711,20 +525,36 @@ def find_raw_files(
     selected_cells: list[str] | None,
 ) -> list[Path]:
     files = sorted(input_dir.glob(pattern))
+
+    wp51_files = []
+    for path in files:
+        cell_id = infer_cell_id(path)
+        if is_wp51_hcc_cell(cell_id):
+            wp51_files.append(path)
+
     if selected_cells:
+        invalid_cells = sorted(
+            cell for cell in selected_cells if not is_wp51_hcc_cell(cell)
+        )
+        if invalid_cells:
+            raise ValueError(
+                "Only Ca_01-Ca_25 are valid for WP5.1. Invalid selection: "
+                + ", ".join(invalid_cells)
+            )
+
         selected = set(selected_cells)
-        files = [
-            path for path in files
-            if infer_cell_id(path) in selected
+        wp51_files = [
+            path for path in wp51_files if infer_cell_id(path) in selected
         ]
-    return files
+
+    return sorted(wp51_files, key=lambda path: cell_number(infer_cell_id(path)))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run raw-data and preprocessing-method analyses for "
-            "GSE65364 HCC cells."
+            "Analyze the 25 GSE65364 human HCC scRRBS cells for "
+            "DeepMeth Work Package 5.1."
         )
     )
     parser.add_argument(
@@ -739,7 +569,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pattern",
-        default="*_Ca_*_RRBS.single.CpG.txt.gz",
+        default=DEFAULT_PATTERN,
     )
     parser.add_argument(
         "--cells",
@@ -750,7 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-cells",
         type=int,
-        default=26,
+        default=25,
         help="Expected file count when --cells is not used.",
     )
     return parser.parse_args()
@@ -758,6 +588,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if not args.input_dir.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {args.input_dir}")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     raw_files = find_raw_files(
@@ -768,13 +602,14 @@ def main() -> None:
 
     if not raw_files:
         raise FileNotFoundError(
-            f"No raw files found in {args.input_dir} "
+            f"No WP5.1 HCC files found in {args.input_dir} "
             f"with pattern {args.pattern}"
         )
 
     if args.cells is None and len(raw_files) != args.expected_cells:
         raise RuntimeError(
-            f"Expected {args.expected_cells} files, found {len(raw_files)}."
+            f"Expected {args.expected_cells} Ca_01-Ca_25 files, "
+            f"found {len(raw_files)}."
         )
 
     plt.rcParams.update(
@@ -789,75 +624,84 @@ def main() -> None:
         }
     )
 
-    summaries = []
+    summaries: list[dict[str, float | int | str]] = []
+
     for index, raw_path in enumerate(raw_files, start=1):
         cell_id = infer_cell_id(raw_path)
-        print(f"[{index}/{len(raw_files)}] Analyzing {cell_id}: {raw_path.name}")
+        print(
+            f"[{index:02d}/{len(raw_files):02d}] "
+            f"Analyzing {cell_id}: {raw_path.name}"
+        )
         summaries.append(analyze_cell(raw_path, args.output_dir))
 
-    all_cells_summary = pd.DataFrame(summaries).sort_values("cell_id")
+    all_cells_summary = (
+        pd.DataFrame(summaries)
+        .sort_values("cell_id")
+        .reset_index(drop=True)
+    )
     save_table(
         all_cells_summary,
-        args.output_dir / "all_cells_analysis_summary.csv",
+        args.output_dir / "wp5_1_all_cells_analysis_summary.csv",
     )
 
-    # Overall figure: final labeled dataset size
+    # Overall figure 1: final physical CpG counts.
     fig, ax = plt.subplots(figsize=(11.5, 5.5))
-    x = np.arange(len(all_cells_summary))
-    width = 0.38
     ax.bar(
-        x - width / 2,
-        all_cells_summary["merged_labeled_cpgs"],
-        width=width,
-        label="Merged strands",
-    )
-    ax.bar(
-        x + width / 2,
-        all_cells_summary["c_plus_labeled_cpgs"],
-        width=width,
-        label="C/+ only",
-    )
-    ax.set_title("Final Labeled CpG Count Across HCC Cells")
-    ax.set_xlabel("HCC Cell")
-    ax.set_ylabel("Number of Labeled CpG Sites")
-    ax.set_xticks(x)
-    ax.set_xticklabels(
         all_cells_summary["cell_id"],
-        rotation=60,
-        ha="right",
+        all_cells_summary["physical_cpgs"],
     )
-    ax.legend(frameon=False)
-    save_figure(
-        fig,
-        args.output_dir / "all_cells_dataset_size_comparison.png",
-    )
-
-    # Overall figure: label agreement
-    fig, ax = plt.subplots(figsize=(11.5, 5.0))
-    ax.plot(
-        all_cells_summary["cell_id"],
-        all_cells_summary["label_agreement_percentage"],
-        marker="o",
-    )
-    ax.set_title("Label Agreement Between Methods Across HCC Cells")
+    ax.set_title("Final Physical CpG Count Across the 25 HCC Cells")
     ax.set_xlabel("HCC Cell")
-    ax.set_ylabel("Label Agreement (%)")
+    ax.set_ylabel("Number of Physical CpG Sites")
     ax.tick_params(axis="x", rotation=60)
     save_figure(
         fig,
-        args.output_dir / "all_cells_label_agreement.png",
+        args.output_dir / "wp5_1_all_cells_physical_cpg_count.png",
     )
 
-    print("\nAnalysis completed.")
+    # Overall figure 2: methylated percentage across cells.
+    fig, ax = plt.subplots(figsize=(11.5, 5.0))
+    ax.plot(
+        all_cells_summary["cell_id"],
+        all_cells_summary["methylated_percentage"],
+        marker="o",
+    )
+    ax.set_title("Methylated CpG Percentage Across the 25 HCC Cells")
+    ax.set_xlabel("HCC Cell")
+    ax.set_ylabel("Methylated CpGs (%)")
+    ax.tick_params(axis="x", rotation=60)
+    save_figure(
+        fig,
+        args.output_dir / "wp5_1_all_cells_methylated_percentage.png",
+    )
+
+    # Overall figure 3: tie records retained as label 0.
+    fig, ax = plt.subplots(figsize=(11.5, 5.0))
+    ax.bar(
+        all_cells_summary["cell_id"],
+        all_cells_summary["ties_retained_as_label_0"],
+    )
+    ax.set_title("Equal Read-Count CpGs Retained as Unmethylated")
+    ax.set_xlabel("HCC Cell")
+    ax.set_ylabel("Number of Tie CpG Sites")
+    ax.tick_params(axis="x", rotation=60)
+    save_figure(
+        fig,
+        args.output_dir / "wp5_1_all_cells_tie_counts.png",
+    )
+
+    print("\nWP5.1 analysis completed.")
     print(f"Output directory: {args.output_dir}")
     print(
         all_cells_summary[
             [
                 "cell_id",
                 "raw_records",
-                "merged_labeled_cpgs",
-                "c_plus_labeled_cpgs",
-                "label_agreement_percentage",
+                "physical_cpgs",
+                "ties_retained_as_label_0",
+                "unmethylated_count",
+                "methylated_count",
+                "methylated_percentage",
             ]
         ].to_string(index=False)
     )
