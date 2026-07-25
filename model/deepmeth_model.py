@@ -26,7 +26,9 @@ class DeepMethConcatenation(nn.Module):
         925 + 128 + 480 = 1533
 
     Output:
-        Binary methylation probability [B, 1]
+        Raw methylation logit [B, 1] (unnormalized - pass through
+        torch.sigmoid to get a probability, or use directly with
+        nn.BCEWithLogitsLoss for training)
     """
 
     def __init__(
@@ -59,9 +61,12 @@ class DeepMethConcatenation(nn.Module):
             1,
         )
 
-        # The original ncVarPred model applies sigmoid
-        # after the final fully connected layer.
-        self.sigmoid = nn.Sigmoid()
+        # No sigmoid here - the model returns a raw logit. Training uses
+        # nn.BCEWithLogitsLoss(pos_weight=...) directly on that logit
+        # (numerically stabler than a separate sigmoid + BCELoss, and lets
+        # the class-imbalance pos_weight be applied); torch.sigmoid is
+        # applied afterward only where an actual probability is needed
+        # (metrics, thresholding at inference).
 
     def forward(
         self,
@@ -89,7 +94,7 @@ class DeepMethConcatenation(nn.Module):
                 Physicochemical feature matrix [B, 12, 500].
 
         Returns:
-            Methylation probabilities [B, 1].
+            Raw methylation logits [B, 1].
         """
 
         # [B, 4, 501] -> [B, 925]
@@ -126,11 +131,6 @@ class DeepMethConcatenation(nn.Module):
         # [B, 1533] -> [B, 1]
         output = self.fc2(
             concatenated_output
-        )
-
-        # Binary methylation probability.
-        output = self.sigmoid(
-            output
         )
 
         return output

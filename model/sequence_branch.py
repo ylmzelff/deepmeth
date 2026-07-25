@@ -137,7 +137,3 @@ class DanQ_Sequence(nn.Module):
         )
 
         return seq_output
-
-
-_
-  

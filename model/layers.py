@@ -109,6 +109,3 @@ class GraphConvolution(Module):
             + str(self.out_features)
             + ")"
         )
-
-
-_

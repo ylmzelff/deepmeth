@@ -51,15 +51,32 @@ def normalize_chromosome_name(name: str) -> str:
     return f"chr{suffix}"
 
 
-def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile"]:
-    """One row per 100kb bin across chr1-22 + chrX, in a fixed global order."""
+def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile", dict[str, str]]:
+    """One row per 100kb bin across chr1-22 + chrX, in a fixed global order.
+
+    Also returns a {normalized_name: raw_name} map, since .hic files vary in
+    whether they store chromosomes as "chr1" or "1" - matrixZoomData lookups
+    must use the file's own raw name, not a name we guessed.
+    """
     hic_file = hicstraw.HiCFile(str(HIC_RAW_FILE_PATH))
 
-    chrom_lengths = {
-        normalize_chromosome_name(chrom.name): chrom.length
-        for chrom in hic_file.getChromosomes()
-        if normalize_chromosome_name(chrom.name) in INCLUDED_CHROMOSOMES
-    }
+    available_resolutions = hic_file.getResolutions()
+    print(f"Resolutions available in the .hic file: {available_resolutions}")
+
+    if GRAPH_RESOLUTION not in available_resolutions:
+        raise RuntimeError(
+            f"{GRAPH_RESOLUTION:,} bp is not one of the resolutions stored in this .hic file: "
+            f"{available_resolutions}. Pick one of those instead (GRAPH_RESOLUTION in config)."
+        )
+
+    raw_names: dict[str, str] = {}
+    chrom_lengths: dict[str, int] = {}
+
+    for chrom in hic_file.getChromosomes():
+        normalized = normalize_chromosome_name(chrom.name)
+        if normalized in INCLUDED_CHROMOSOMES:
+            raw_names[normalized] = chrom.name
+            chrom_lengths[normalized] = chrom.length
 
     missing = set(INCLUDED_CHROMOSOMES) - set(chrom_lengths)
     if missing:
@@ -68,9 +85,9 @@ def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile"]:
             "Check that it is really GRCh38 with chr1-22 + chrX."
         )
 
-    print("Chromosome lengths from the .hic file:")
+    print("Chromosome lengths from the .hic file (normalized name <- raw name in file):")
     for chrom in INCLUDED_CHROMOSOMES:
-        print(f"  {chrom}: {chrom_lengths[chrom]:,} bp")
+        print(f"  {chrom} <- {raw_names[chrom]!r}: {chrom_lengths[chrom]:,} bp")
 
     rows = []
     for chrom in INCLUDED_CHROMOSOMES:
@@ -86,10 +103,10 @@ def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile"]:
     if duplicate_count:
         raise RuntimeError(f"{duplicate_count} duplicate (chrom, bin_start) bins in the node index.")
 
-    return node_index, hic_file
+    return node_index, hic_file, raw_names
 
 
-def build_raw_adjacency(node_index: pd.DataFrame, hic_file) -> sp.coo_matrix:
+def build_raw_adjacency(node_index: pd.DataFrame, hic_file, raw_names: dict[str, str]) -> sp.coo_matrix:
     """Intra-chromosomal observed contact counts only, block-diagonal by chromosome."""
     number_of_nodes = len(node_index)
 
@@ -101,13 +118,15 @@ def build_raw_adjacency(node_index: pd.DataFrame, hic_file) -> sp.coo_matrix:
     row_indices: list[np.ndarray] = []
     col_indices: list[np.ndarray] = []
     values: list[np.ndarray] = []
+    chromosomes_with_no_records: list[str] = []
 
     for chrom in INCLUDED_CHROMOSOMES:
         offset = chrom_to_node_offset[chrom]
+        raw_name = raw_names[chrom]
 
         matrix_zoom_data = hic_file.getMatrixZoomData(
-            chrom.removeprefix("chr"),
-            chrom.removeprefix("chr"),
+            raw_name,
+            raw_name,
             "observed",
             "NONE",
             "BP",
@@ -117,9 +136,10 @@ def build_raw_adjacency(node_index: pd.DataFrame, hic_file) -> sp.coo_matrix:
         chrom_length = int(node_index.loc[node_index["chrom"] == chrom, "bin_end"].max())
         records = matrix_zoom_data.getRecords(0, chrom_length, 0, chrom_length)
 
-        print(f"  {chrom}: {len(records):,} raw contact records")
+        print(f"  {chrom} (raw name {raw_name!r}): {len(records):,} raw contact records")
 
         if not records:
+            chromosomes_with_no_records.append(chrom)
             continue
 
         bin_x = np.array([record.binX for record in records], dtype=np.int64) // GRAPH_RESOLUTION
@@ -129,6 +149,20 @@ def build_raw_adjacency(node_index: pd.DataFrame, hic_file) -> sp.coo_matrix:
         row_indices.append(bin_x + offset)
         col_indices.append(bin_y + offset)
         values.append(counts)
+
+    if chromosomes_with_no_records:
+        print(
+            f"WARNING: no contact records for {len(chromosomes_with_no_records)} chromosome(s): "
+            f"{chromosomes_with_no_records}"
+        )
+
+    if not row_indices:
+        raise RuntimeError(
+            "No Hi-C contact records were found for any chromosome. This usually means either "
+            "the raw chromosome name or the resolution passed to getMatrixZoomData does not "
+            "match what's actually stored in the .hic file - check the 'raw name' and "
+            "'Resolutions available' lines printed above against what this call used."
+        )
 
     all_rows = np.concatenate(row_indices)
     all_cols = np.concatenate(col_indices)
@@ -180,14 +214,14 @@ def main() -> None:
     GRAPH_DIR.mkdir(parents=True, exist_ok=True)
 
     print("\n[1/3] Building node index")
-    node_index, hic_file = build_node_index()
+    node_index, hic_file, raw_names = build_node_index()
     print(f"Total nodes: {len(node_index):,}")
 
     node_index.to_parquet(NODE_INDEX_PATH, index=False)
     print(f"Saved: {NODE_INDEX_PATH}")
 
     print("\n[2/3] Reading intra-chromosomal Hi-C contacts")
-    raw_adjacency = build_raw_adjacency(node_index, hic_file)
+    raw_adjacency = build_raw_adjacency(node_index, hic_file, raw_names)
     print(f"Raw adjacency non-zero entries: {raw_adjacency.nnz:,}")
 
     print("\n[3/3] Normalizing adjacency (self-loops + symmetric degree norm)")

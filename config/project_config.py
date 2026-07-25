@@ -26,6 +26,7 @@ DATASET_DIR = PROCESSED_DIR / "dataset"  # train.parquet / validation.parquet / 
 
 FEATURES_DIR = DATA_DIR / "features"
 PHYSICOCHEMICAL_FEATURES_DIR = FEATURES_DIR / "physicochemical"
+SEQUENCE_CODES_DIR = FEATURES_DIR / "sequence_codes"
 DNABERT_NODE_FEATURES_DIR = FEATURES_DIR / "dnabert2_node_features"
 
 GRAPH_DIR = DATA_DIR / "graph"
@@ -75,6 +76,12 @@ HIC_RAW_FILE_PATH = HIC_RAW_DIR / f"{HIC_FILE_ACCESSION}.hic"
 SEQUENCE_LENGTH = 501
 CENTER_INDEX = SEQUENCE_LENGTH // 2  # 250
 MAX_UNKNOWN_FRACTION = 0.10
+
+# One-hot base order for the sequence branch; index i is channel i of the
+# [4, 501] one-hot input. "N" (and anything else) gets UNKNOWN_BASE_CODE,
+# expanded to an all-zero one-hot column at load time.
+BASE_ORDER = "ACGT"
+UNKNOWN_BASE_CODE = 4
 
 # ============================================================
 # WGBS replicate preprocessing — NEW for the HepG2 pivot, open to discussion
@@ -164,5 +171,10 @@ TRAINING_SEED = 42
 # "auto" computes pos_weight = n_negative / n_positive from the TRAIN split only;
 # pass a float instead to override.
 POS_WEIGHT_MODE = "auto"
+
+# Shards are read in shuffled order and fed into a shuffle buffer (npz shards
+# are compressed, so they aren't randomly-indexable - this is the standard
+# shard-streaming shuffle pattern). ~2 shards worth of rows.
+SHUFFLE_BUFFER_SIZE = 100_000
 
 DEVICE = "cuda:0"
