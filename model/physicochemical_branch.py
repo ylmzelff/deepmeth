@@ -1,12 +1,5 @@
-from pathlib import Path
-
 import torch
 import torch.nn as nn
-
-from feature_extraction.physicochemical_features import (
-    convertSampleToPhyChemVector_Di,
-    load_physicochemical_properties_di,
-)
 
 
 MAXPOOL1D_KERNEL_SIZE = 2

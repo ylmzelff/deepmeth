@@ -102,6 +102,11 @@ INCLUDED_CHROMOSOMES = AUTOSOME_CHROMOSOMES + ["chrX"]  # chrY / chrM excluded
 PHYSICOCHEMICAL_MATRIX_SHAPE = (12, SEQUENCE_LENGTH - 1)  # [12, 500]
 PHYSICOCHEMICAL_CNN_OUTPUT_DIM = 480
 
+# Rows per shard file. At this scale (tens of millions of CpGs) a small
+# shard size would create tens of thousands of tiny files; 50k keeps shard
+# count reasonable (~430 shards for a 21M-row split) at ~500MB/shard.
+PHYSICOCHEMICAL_SHARD_SIZE = 50_000
+
 # ============================================================
 # Hi-C / graph branch
 # ============================================================
