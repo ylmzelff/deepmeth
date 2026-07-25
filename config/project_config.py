@@ -116,14 +116,17 @@ GRAPH_INTRA_CHROMOSOME_ONLY = True  # inter-chromosomal contacts set to 0 (tract
 NODE_FEATURE_DIM = 768  # DNABERT-2 hidden size
 
 # ============================================================
-# DNABERT-2 (unchanged)
+# DNABERT-2 (model/tokenizer settings unchanged; shard size increased for
+# the new dataset's scale - the old 4096 default was tuned for the ~5M-row
+# GSE65364 dataset and would create 5,000+ tiny shard files for the 21M-row
+# HepG2 train split)
 # ============================================================
 
 DNABERT_MODEL_NAME = "zhihan1996/DNABERT-2-117M"
 DNABERT_MODEL_REVISION = "ec1f874253852eb3907081f57294991b4280ceb6"
 DNABERT_HIDDEN_SIZE = 768
 DNABERT_BATCH_SIZE = 64
-DNABERT_SHARD_SIZE = 4096
+DNABERT_SHARD_SIZE = 50_000
 DNABERT_SAVE_DTYPE = "float16"
 DNABERT_TOKENIZER_MAX_LENGTH = 512
 
