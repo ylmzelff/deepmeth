@@ -26,7 +26,7 @@ DATASET_DIR = PROCESSED_DIR / "dataset"  # train.parquet / validation.parquet / 
 
 FEATURES_DIR = DATA_DIR / "features"
 PHYSICOCHEMICAL_FEATURES_DIR = FEATURES_DIR / "physicochemical"
-DNABERT_FEATURES_DIR = FEATURES_DIR / "dnabert2"
+DNABERT_NODE_FEATURES_DIR = FEATURES_DIR / "dnabert2_node_features"
 
 GRAPH_DIR = DATA_DIR / "graph"
 HIC_RAW_DIR = DATA_DIR / "hic" / "raw"
@@ -116,19 +116,22 @@ GRAPH_INTRA_CHROMOSOME_ONLY = True  # inter-chromosomal contacts set to 0 (tract
 NODE_FEATURE_DIM = 768  # DNABERT-2 hidden size
 
 # ============================================================
-# DNABERT-2 (model/tokenizer settings unchanged; shard size increased for
-# the new dataset's scale - the old 4096 default was tuned for the ~5M-row
-# GSE65364 dataset and would create 5,000+ tiny shard files for the 21M-row
-# HepG2 train split)
+# DNABERT-2 (model/tokenizer settings unchanged). Embedding every one of
+# the ~26.5M CpGs individually was projected to take ~15+ hours and isn't
+# actually needed: the graph branch only ever consumes one pooled feature
+# per 100kb node, not a per-CpG embedding. So we embed only a deterministic
+# sample of up to DNABERT_MAX_CPG_PER_NODE CpGs per node (drawn from
+# train+validation+test combined - see [[dnabert_node_feature_sampling]])
+# and mean-pool those into the node feature.
 # ============================================================
 
 DNABERT_MODEL_NAME = "zhihan1996/DNABERT-2-117M"
 DNABERT_MODEL_REVISION = "ec1f874253852eb3907081f57294991b4280ceb6"
 DNABERT_HIDDEN_SIZE = 768
-DNABERT_BATCH_SIZE = 64
-DNABERT_SHARD_SIZE = 50_000
+DNABERT_BATCH_SIZE = 256
 DNABERT_SAVE_DTYPE = "float16"
 DNABERT_TOKENIZER_MAX_LENGTH = 512
+DNABERT_MAX_CPG_PER_NODE = 64
 
 # ============================================================
 # Model architecture dimensions (fixed — ported as-is, do not change)

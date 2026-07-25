@@ -1,11 +1,18 @@
 """
-Extract frozen DNABERT-2 embeddings for every CpG in train/validation/test.parquet
-(the raw material for the graph branch's node features, before per-node mean
-pooling in prepare_graph_features.py).
+Create DNABERT-2 node features for the Hi-C graph.
 
-Requires a CUDA GPU. Each split is skipped automatically if it was already
-fully extracted in a previous run (its *_extraction_summary.json exists) -
-safe to just re-run this script if a Colab session drops mid-way.
+CpGs from train+validation+test are combined (chromosome-disjoint splits
+already prevent leakage - a node's chromosome belongs to exactly one split,
+and DNABERT-2 embeddings are frozen/unsupervised, so there is no label
+information to leak). Using train CpGs only would leave every node on a
+validation/test chromosome with zero contributing CpGs, since those
+chromosomes never appear in the train split at all.
+
+CpGs are mapped to 100-kb genomic nodes. At most a fixed number of CpGs is
+selected deterministically from each node. Their frozen DNABERT-2
+embeddings are mean-pooled to produce one 768-dimensional feature vector
+per node. Output is one file per chromosome, so an interrupted run can
+just be re-run - completed chromosomes are skipped.
 
 Usage (no arguments needed):
 
@@ -23,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -32,17 +40,20 @@ from config.project_config import (
     DATASET_DIR,
     DNABERT_BATCH_SIZE,
     DNABERT_HIDDEN_SIZE,
-    DNABERT_FEATURES_DIR,
+    DNABERT_MAX_CPG_PER_NODE,
     DNABERT_MODEL_NAME,
     DNABERT_MODEL_REVISION,
+    DNABERT_NODE_FEATURES_DIR,
     DNABERT_SAVE_DTYPE,
-    DNABERT_SHARD_SIZE,
     DNABERT_TOKENIZER_MAX_LENGTH,
+    GRAPH_RESOLUTION,
     SEQUENCE_LENGTH,
 )
 
 SPLIT_NAMES = ("train", "validation", "test")
-COLUMNS_TO_READ = ["sequence", "label", "chrom", "canonical_position"]
+SPLIT_PATHS = {split: DATASET_DIR / f"{split}.parquet" for split in SPLIT_NAMES}
+
+COLUMNS_TO_READ = ["chrom", "canonical_position", "sequence"]
 
 
 def load_frozen_model(device: torch.device):
@@ -57,6 +68,13 @@ def load_frozen_model(device: torch.device):
     config.output_hidden_states = False
     config.output_attentions = False
     config.return_dict = True
+
+    # Avoid DNABERT-2's custom Triton flash-attention kernel, which needs
+    # more shared memory than some GPUs (e.g. T4) provide. Forcing a
+    # nonzero dropout routes the model through its plain PyTorch attention
+    # path instead. Harmless: the model runs in eval()/inference_mode(),
+    # where nn.Dropout is always a no-op regardless of its probability.
+    config.attention_probs_dropout_prob = 0.1
 
     model = AutoModel.from_pretrained(
         DNABERT_MODEL_NAME,
@@ -73,7 +91,9 @@ def load_frozen_model(device: torch.device):
         parameter.requires_grad = False
 
     trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    assert trainable_parameters == 0
+
+    if trainable_parameters != 0:
+        raise RuntimeError("DNABERT-2 must remain completely frozen.")
 
     return tokenizer, model
 
@@ -85,82 +105,94 @@ def masked_mean_pooling(token_embeddings: torch.Tensor, attention_mask: torch.Te
     return summed / valid_counts
 
 
-def save_shard(output_path: Path, embeddings, labels, chromosomes, positions) -> None:
-    np.savez_compressed(
-        output_path,
-        embeddings=embeddings,
-        labels=np.asarray(labels, dtype=np.int8),
-        chromosomes=np.asarray(chromosomes, dtype="U32"),
-        positions=np.asarray(positions, dtype=np.int64),
-    )
+def find_all_chromosomes() -> list[str]:
+    """Union of chromosomes across train+validation+test (not just train)."""
+    chromosomes: set[str] = set()
+
+    for split_name, path in SPLIT_PATHS.items():
+        if not path.exists():
+            raise FileNotFoundError(f"{path} does not exist. Run preprocessing/preprocess.py first.")
+
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches(batch_size=1_000_000, columns=["chrom"]):
+            chromosomes.update(batch.column("chrom").to_pylist())
+
+    def chromosome_key(chromosome: str) -> tuple[int, str]:
+        suffix = chromosome.removeprefix("chr")
+        return (int(suffix), "") if suffix.isdigit() else (10_000, suffix)
+
+    return sorted(chromosomes, key=chromosome_key)
 
 
-def process_split(
-    split_name: str,
-    parquet_path: Path,
+def load_chromosome(chromosome: str) -> pd.DataFrame:
+    """Load one chromosome's CpGs from train+validation+test combined."""
+    frames = []
+
+    for split_name, path in SPLIT_PATHS.items():
+        table = pq.read_table(path, columns=COLUMNS_TO_READ, filters=[("chrom", "=", chromosome)])
+        frame = table.to_pandas()
+        frames.append(frame)
+        print(f"  {split_name}: {len(frame):,} CpGs on {chromosome}")
+
+    dataframe = pd.concat(frames, ignore_index=True)
+    dataframe = dataframe.sort_values("canonical_position").reset_index(drop=True)
+
+    dataframe["bin_start"] = (
+        (dataframe["canonical_position"] - 1) // GRAPH_RESOLUTION * GRAPH_RESOLUTION
+    ).astype("int64")
+
+    return dataframe
+
+
+def select_cpgs_per_node(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Select CpGs deterministically and approximately evenly across every 100-kb node."""
+    bin_starts = dataframe["bin_start"].to_numpy(dtype=np.int64)
+
+    unique_bins, first_indices, counts = np.unique(bin_starts, return_index=True, return_counts=True)
+
+    selected_indices: list[np.ndarray] = []
+
+    for start, count in zip(first_indices, counts):
+        if count <= DNABERT_MAX_CPG_PER_NODE:
+            local_indices = np.arange(count, dtype=np.int64)
+        else:
+            local_indices = np.linspace(0, count - 1, num=DNABERT_MAX_CPG_PER_NODE, dtype=np.int64)
+            local_indices = np.unique(local_indices)
+
+        selected_indices.append(start + local_indices)
+
+    selected = dataframe.iloc[np.concatenate(selected_indices)].copy().reset_index(drop=True)
+
+    print(f"  Nodes: {len(unique_bins):,}")
+    print(f"  Source CpGs: {len(dataframe):,}")
+    print(f"  Selected CpGs: {len(selected):,}")
+
+    return selected
+
+
+def embed_and_pool_nodes(
+    dataframe: pd.DataFrame,
     tokenizer,
     model,
     device: torch.device,
-    save_dtype,
-) -> dict:
-    output_dir = DNABERT_FEATURES_DIR / split_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    unique_bins, inverse_indices = np.unique(dataframe["bin_start"].to_numpy(dtype=np.int64), return_inverse=True)
 
-    summary_path = output_dir / f"{split_name}_extraction_summary.json"
+    node_sums = np.zeros((len(unique_bins), DNABERT_HIDDEN_SIZE), dtype=np.float32)
+    node_counts = np.zeros(len(unique_bins), dtype=np.int32)
 
-    if summary_path.exists():
-        print(f"{split_name}: already extracted, skipping ({summary_path})")
-        return json.loads(summary_path.read_text(encoding="utf-8"))
+    total_rows = len(dataframe)
+    started_at = time.time()
 
-    parquet_file = pq.ParquetFile(parquet_path)
-    source_rows = parquet_file.metadata.num_rows
+    for batch_start in range(0, total_rows, DNABERT_BATCH_SIZE):
+        batch_end = min(batch_start + DNABERT_BATCH_SIZE, total_rows)
+        batch = dataframe.iloc[batch_start:batch_end]
 
-    print(f"\n{split_name}: {source_rows:,} rows to embed")
+        sequences = batch["sequence"].astype(str).str.upper().tolist()
 
-    embedding_buffer, label_buffer, chrom_buffer, position_buffer = [], [], [], []
-    processed_rows = 0
-    shard_index = 0
-    start_time = time.time()
-
-    def flush_buffer() -> None:
-        nonlocal shard_index, embedding_buffer, label_buffer, chrom_buffer, position_buffer
-
-        if not embedding_buffer:
-            return
-
-        embeddings = np.concatenate(embedding_buffer, axis=0).astype(save_dtype, copy=False)
-        labels = np.concatenate(label_buffer, axis=0)
-        chromosomes = np.concatenate(chrom_buffer, axis=0)
-        positions = np.concatenate(position_buffer, axis=0)
-
-        while len(embeddings) > 0:
-            take = min(DNABERT_SHARD_SIZE, len(embeddings))
-            shard_path = output_dir / f"{split_name}_dnabert2_{shard_index:05d}.npz"
-
-            save_shard(
-                shard_path,
-                embeddings[:take],
-                labels[:take],
-                chromosomes[:take],
-                positions[:take],
-            )
-
-            print(f"  [SAVED] {shard_path.name} | rows={take:,}")
-
-            shard_index += 1
-            embeddings, labels = embeddings[take:], labels[take:]
-            chromosomes, positions = chromosomes[take:], positions[take:]
-
-        embedding_buffer, label_buffer, chrom_buffer, position_buffer = [], [], [], []
-
-    for record_batch in parquet_file.iter_batches(batch_size=DNABERT_BATCH_SIZE, columns=COLUMNS_TO_READ):
-        dataframe = record_batch.to_pandas()
-
-        sequences = dataframe["sequence"].astype(str).str.upper().tolist()
-
-        invalid_lengths = [i for i, seq in enumerate(sequences) if len(seq) != SEQUENCE_LENGTH]
-        if invalid_lengths:
-            raise ValueError(f"Invalid sequence length in batch, first local index: {invalid_lengths[0]}")
+        invalid_length_count = sum(len(sequence) != SEQUENCE_LENGTH for sequence in sequences)
+        if invalid_length_count:
+            raise ValueError(f"{invalid_length_count} invalid sequence lengths were detected.")
 
         encoded = tokenizer(
             sequences,
@@ -176,80 +208,144 @@ def process_split(
                 outputs = model(**encoded)
                 pooled = masked_mean_pooling(outputs[0], encoded["attention_mask"])
 
-        assert pooled.shape == (len(sequences), DNABERT_HIDDEN_SIZE)
+        if pooled.shape != (len(sequences), DNABERT_HIDDEN_SIZE):
+            raise RuntimeError(f"Unexpected embedding shape: {tuple(pooled.shape)}")
 
         if not torch.isfinite(pooled).all():
-            raise FloatingPointError("NaN or Inf detected in DNABERT embeddings.")
+            raise FloatingPointError("NaN or Inf detected in embeddings.")
 
-        embedding_buffer.append(pooled.detach().cpu().float().numpy())
-        label_buffer.append(dataframe["label"].to_numpy(dtype=np.int8))
-        chrom_buffer.append(dataframe["chrom"].astype(str).to_numpy(dtype="U32"))
-        position_buffer.append(dataframe["canonical_position"].to_numpy(dtype=np.int64))
+        batch_embeddings = pooled.detach().cpu().float().numpy()
+        batch_node_indices = inverse_indices[batch_start:batch_end]
 
-        processed_rows += len(dataframe)
+        np.add.at(node_sums, batch_node_indices, batch_embeddings)
+        np.add.at(node_counts, batch_node_indices, 1)
 
-        if sum(len(a) for a in embedding_buffer) >= DNABERT_SHARD_SIZE:
-            flush_buffer()
+        processed = batch_end
 
-        if processed_rows % (DNABERT_BATCH_SIZE * 50) == 0 or processed_rows == source_rows:
-            elapsed = time.time() - start_time
-            rate = processed_rows / elapsed if elapsed > 0 else 0
-            print(f"  [PROGRESS] {processed_rows:,}/{source_rows:,} | {rate:.1f} rows/s")
+        if processed % (DNABERT_BATCH_SIZE * 50) == 0 or processed == total_rows:
+            elapsed = time.time() - started_at
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            print(f"  [PROGRESS] {processed:,}/{total_rows:,} | {rate:.1f} rows/s")
 
-    flush_buffer()
+    if (node_counts == 0).any():
+        raise RuntimeError("At least one selected node received no embeddings.")
 
-    elapsed_seconds = time.time() - start_time
+    node_features = node_sums / node_counts[:, None]
 
-    summary = {
-        "created_at": datetime.now().isoformat(),
-        "split": split_name,
-        "model_name": DNABERT_MODEL_NAME,
-        "model_revision": DNABERT_MODEL_REVISION,
-        "frozen": True,
-        "pooling": "attention_masked_mean",
-        "source_rows": int(source_rows),
-        "processed_rows": int(processed_rows),
-        "shard_count": int(shard_index),
-        "embedding_dimension": DNABERT_HIDDEN_SIZE,
-        "embedding_dtype": DNABERT_SAVE_DTYPE,
-        "elapsed_seconds": float(elapsed_seconds),
-        "rows_per_second": float(processed_rows / elapsed_seconds) if elapsed_seconds > 0 else 0.0,
+    return unique_bins, node_features, node_counts
+
+
+def process_chromosome(chromosome: str, tokenizer, model, device: torch.device, save_dtype) -> dict:
+    output_path = DNABERT_NODE_FEATURES_DIR / f"{chromosome}_dnabert2_node_features.npz"
+
+    if output_path.exists():
+        print(f"{chromosome}: already completed, skipping")
+
+        with np.load(output_path) as data:
+            return {
+                "chrom": chromosome,
+                "node_count": int(len(data["bin_starts"])),
+                "selected_cpg_count": int(data["sample_counts"].sum()),
+                "output_path": str(output_path),
+                "skipped": True,
+            }
+
+    print("\n" + "=" * 70)
+    print(f"Processing chromosome: {chromosome}")
+    print("=" * 70)
+
+    dataframe = load_chromosome(chromosome)
+    selected = select_cpgs_per_node(dataframe)
+    bin_starts, node_features, sample_counts = embed_and_pool_nodes(selected, tokenizer, model, device)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        output_path,
+        chromosomes=np.full(len(bin_starts), chromosome, dtype="U16"),
+        bin_starts=bin_starts.astype(np.int64),
+        embeddings=node_features.astype(save_dtype),
+        sample_counts=sample_counts.astype(np.int16),
+    )
+
+    print(f"[SAVED] {output_path}")
+    print(f"  Node features: {node_features.shape}")
+
+    return {
+        "chrom": chromosome,
+        "source_cpg_count": int(len(dataframe)),
+        "selected_cpg_count": int(len(selected)),
+        "node_count": int(len(bin_starts)),
+        "output_path": str(output_path),
+        "skipped": False,
     }
-
-    assert processed_rows == source_rows
-
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    print(f"{split_name}: completed in {elapsed_seconds / 60:.1f} minutes")
-
-    return summary
 
 
 def main() -> None:
+    for path in SPLIT_PATHS.values():
+        if not path.exists():
+            raise FileNotFoundError(f"{path} does not exist. Run preprocessing/preprocess.py first.")
+
     if not torch.cuda.is_available():
-        raise RuntimeError("A CUDA GPU is required for DNABERT-2 embedding extraction.")
+        raise RuntimeError("A CUDA GPU is required.")
 
     device = torch.device("cuda")
     save_dtype = np.float16 if DNABERT_SAVE_DTYPE == "float16" else np.float32
 
+    DNABERT_NODE_FEATURES_DIR.mkdir(parents=True, exist_ok=True)
+
     print("=" * 70)
-    print("DNABERT-2 embedding extraction")
+    print("DNABERT-2 node-feature extraction (train + validation + test)")
     print("=" * 70)
-    print(f"Model: {DNABERT_MODEL_NAME} (revision {DNABERT_MODEL_REVISION})")
+    print(f"Datasets: {list(SPLIT_PATHS.values())}")
+    print(f"Graph resolution: {GRAPH_RESOLUTION:,}")
+    print(f"Maximum CpGs per node: {DNABERT_MAX_CPG_PER_NODE}")
     print(f"Device: {device}")
 
     tokenizer, model = load_frozen_model(device)
     print("[PASS] Frozen DNABERT-2 loaded")
 
-    for split_name in SPLIT_NAMES:
-        parquet_path = DATASET_DIR / f"{split_name}.parquet"
+    chromosomes = find_all_chromosomes()
+    print(f"Chromosomes (train+validation+test): {chromosomes}")
 
-        if not parquet_path.exists():
-            raise FileNotFoundError(f"{parquet_path} does not exist. Run preprocessing/preprocess.py first.")
+    started_at = time.time()
+    chromosome_summaries = [
+        process_chromosome(chromosome, tokenizer, model, device, save_dtype) for chromosome in chromosomes
+    ]
 
-        process_split(split_name, parquet_path, tokenizer, model, device, save_dtype)
+    elapsed_seconds = time.time() - started_at
 
-    print("\nDNABERT-2 extraction completed for all splits.")
+    total_nodes = sum(item["node_count"] for item in chromosome_summaries)
+    total_selected_cpgs = sum(item["selected_cpg_count"] for item in chromosome_summaries)
+
+    summary = {
+        "created_at": datetime.now().isoformat(),
+        "model_name": DNABERT_MODEL_NAME,
+        "model_revision": DNABERT_MODEL_REVISION,
+        "frozen": True,
+        "pooling": "masked_mean_per_sequence_then_mean_per_100kb_node",
+        "source_splits": SPLIT_NAMES,
+        "graph_resolution": GRAPH_RESOLUTION,
+        "max_cpg_per_node": DNABERT_MAX_CPG_PER_NODE,
+        "embedding_dimension": DNABERT_HIDDEN_SIZE,
+        "embedding_dtype": DNABERT_SAVE_DTYPE,
+        "chromosome_count": len(chromosomes),
+        "node_count": int(total_nodes),
+        "selected_cpg_count": int(total_selected_cpgs),
+        "elapsed_seconds": float(elapsed_seconds),
+        "chromosomes": chromosome_summaries,
+    }
+
+    summary_path = DNABERT_NODE_FEATURES_DIR / "node_feature_extraction_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print("\n" + "=" * 70)
+    print("DNABERT-2 NODE FEATURES COMPLETED")
+    print("=" * 70)
+    print(f"Selected CpGs: {total_selected_cpgs:,}")
+    print(f"Nodes with features: {total_nodes:,}")
+    print(f"Elapsed time: {elapsed_seconds / 60:.2f} minutes")
+    print(f"Summary: {summary_path}")
 
 
 if __name__ == "__main__":
