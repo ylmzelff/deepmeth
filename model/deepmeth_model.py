@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-from model_training.sequence_cnn_bilstm import DanQ_Sequence
-from model_training.graph_gcn import GCN_Structure
-from model_training.physicochemical_cnn import CNNNet_PhyChemDi
+from model.sequence_branch import DanQ_Sequence
+from model.graph_branch import GCN_Structure
+from model.physicochemical_branch import CNNNet_PhyChemDi
 
 
 class DeepMethConcatenation(nn.Module):

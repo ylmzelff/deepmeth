@@ -1,0 +1,27 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / cloud-sync noise
+desktop.ini
+.DS_Store
+Thumbs.db
+
+# Large / regenerable data and model artifacts
+data/raw/
+data/processed/
+data/features/
+data/hic/
+data/graph/*.npy
+data/graph/*.npz
+data/graph/structure_matching/
+checkpoints/
+*.pt
+*.pth
+
+# Reference genome / large downloads
+data/reference/*.2bit

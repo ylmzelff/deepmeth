@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model_training.layers import GraphConvolution
+from model.layers import GraphConvolution
 
 
 class GCN_Structure(nn.Module):
