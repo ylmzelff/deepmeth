@@ -61,13 +61,13 @@ class DeepMethShardDataset(IterableDataset):
         self.seed = seed
         self.epoch = 0
 
-        physchem_dir = PHYSICOCHEMICAL_FEATURES_DIR / split_name
-        sequence_dir = SEQUENCE_CODES_DIR / split_name
+        self.physchem_dir = PHYSICOCHEMICAL_FEATURES_DIR / split_name
+        self.sequence_dir = SEQUENCE_CODES_DIR / split_name
 
-        with (physchem_dir / "manifest.json").open(encoding="utf-8") as file:
+        with (self.physchem_dir / "manifest.json").open(encoding="utf-8") as file:
             self.physchem_manifest = json.load(file)
 
-        with (sequence_dir / "manifest.json").open(encoding="utf-8") as file:
+        with (self.sequence_dir / "manifest.json").open(encoding="utf-8") as file:
             self.sequence_manifest = json.load(file)
 
         if self.physchem_manifest["shard_count"] != self.sequence_manifest["shard_count"]:
@@ -97,6 +97,17 @@ class DeepMethShardDataset(IterableDataset):
 
         self.negative_count, self.positive_count = self._verify_alignment()
 
+    def _physchem_shard_path(self, shard_record: dict) -> Path:
+        # Shard filenames are deterministic; reconstruct the path from the
+        # current config directory + basename instead of trusting the
+        # manifest's stored "file" field, which can be a stale absolute path
+        # from wherever/whenever the shard was originally written (e.g. a
+        # different mount point or host than the one running now).
+        return self.physchem_dir / Path(shard_record["file"]).name
+
+    def _sequence_shard_path(self, shard_record: dict) -> Path:
+        return self.sequence_dir / Path(shard_record["file"]).name
+
     def _verify_alignment(self) -> tuple[int, int]:
         graph_node_index = pd.read_parquet(NODE_INDEX_PATH, columns=["chrom", "bin_start", "node_index"])
 
@@ -112,12 +123,12 @@ class DeepMethShardDataset(IterableDataset):
                     "physicochemical and sequence-code shards."
                 )
 
-            with np.load(physchem_shard["file"]) as data:
+            with np.load(self._physchem_shard_path(physchem_shard)) as data:
                 labels = data["labels"]
                 chromosomes = data["chromosomes"]
                 positions = data["positions"]
 
-            with np.load(sequence_shard["file"]) as data:
+            with np.load(self._sequence_shard_path(sequence_shard)) as data:
                 sequence_labels = data["labels"]
                 sequence_chromosomes = data["chromosomes"]
                 sequence_positions = data["positions"]
@@ -189,11 +200,11 @@ class DeepMethShardDataset(IterableDataset):
             physchem_shard = self.physchem_manifest["shards"][shard_index]
             sequence_shard = self.sequence_manifest["shards"][shard_index]
 
-            with np.load(physchem_shard["file"]) as data:
+            with np.load(self._physchem_shard_path(physchem_shard)) as data:
                 physchem_codes = data["codes"]
                 labels = data["labels"]
 
-            with np.load(sequence_shard["file"]) as data:
+            with np.load(self._sequence_shard_path(sequence_shard)) as data:
                 sequence_codes = data["codes"]
 
             offset = int(self.shard_offsets[shard_index])
@@ -204,7 +215,14 @@ class DeepMethShardDataset(IterableDataset):
             one_hot = expand_codes_to_one_hot(sequence_codes)
 
             for row in range(row_count):
-                sample = (one_hot[row], physchem_matrix[row], int(node_indices[row]), int(labels[row]))
+                # .copy() is required: one_hot[row]/physchem_matrix[row] are numpy
+                # *views* into the full shard-sized array (basic indexing never
+                # copies). Without copying, every sample sitting in the shuffle
+                # buffer keeps its entire parent shard array alive - with shuffling
+                # scattering live references across many different shards at once,
+                # this pins ~1.6GB per shard in memory for as long as any one of its
+                # rows remains buffered, which OOM-kills the worker after ~15 shards.
+                sample = (one_hot[row].copy(), physchem_matrix[row].copy(), int(node_indices[row]), int(labels[row]))
 
                 if not self.shuffle:
                     yield sample

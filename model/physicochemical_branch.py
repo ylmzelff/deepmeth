@@ -9,6 +9,8 @@ CONV1D_FEATURE_SIZE_BLOCK1 = 32
 CONV1D_FEATURE_SIZE_BLOCK2 = 16
 CONV1D_FEATURE_SIZE_BLOCK3 = 8
 
+NUM_PHYSICOCHEMICAL_PROPERTIES = 12
+
 
 class CNNNet_PhyChemDi(nn.Module):
     """
@@ -19,12 +21,22 @@ class CNNNet_PhyChemDi(nn.Module):
 
     Output:
         [batch_size, 480]
+
+    use_property_gate=True adds a learnable per-property scale (12 values,
+    initialized to 1.0) applied to the raw input before any conv layer - a
+    static/unconditional variant of FiLM (Perez et al., 2018). The learned
+    weights are directly interpretable ("property X matters more than
+    property Y for methylation").
     """
 
-    def __init__(self, dropout_prob: float):
+    def __init__(self, dropout_prob: float, use_property_gate: bool = False):
         super(CNNNet_PhyChemDi, self).__init__()
 
         self.dropout_prob = dropout_prob
+        self.use_property_gate = use_property_gate
+
+        if self.use_property_gate:
+            self.property_gate = nn.Parameter(torch.ones(NUM_PHYSICOCHEMICAL_PROPERTIES))
 
         self.conv1 = nn.Sequential(
             nn.Conv1d(
@@ -100,6 +112,10 @@ class CNNNet_PhyChemDi(nn.Module):
 
         batch_size = inputs.size(0)
 
+        if self.use_property_gate:
+            # [B, 12, 500] * [1, 12, 1] -> [B, 12, 500], broadcast per property
+            inputs = inputs * self.property_gate.view(1, -1, 1)
+
         output = self.pool1(
             self.conv1(inputs)
         )
@@ -118,7 +134,3 @@ class CNNNet_PhyChemDi(nn.Module):
         )
 
         return output
-
-
-
-    

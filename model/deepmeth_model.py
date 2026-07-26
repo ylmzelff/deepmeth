@@ -42,18 +42,28 @@ class DeepMethModel(nn.Module):
         fusion_projected_dim: int,
         fusion_hidden_dim: int,
         fusion_dropout_prob: float,
+        use_sequence_self_attention: bool = False,
+        use_physchem_property_gate: bool = False,
     ):
         super(DeepMethModel, self).__init__()
 
-        # ncVarPred DanQ-based sequence branch.
-        self.sequence_branch = DanQ_Sequence()
+        # ncVarPred DanQ-based sequence branch. use_sequence_self_attention
+        # swaps the BiLSTM for a lightweight Transformer encoder over the
+        # same 36 CNN positions - see model/sequence_branch.py. Default
+        # False reproduces the original DanQ path unchanged.
+        self.sequence_branch = DanQ_Sequence(
+            use_self_attention=use_sequence_self_attention
+        )
 
         # ncVarPred GCN-based structure branch.
         self.structure_branch = GCN_Structure()
 
-        # Yeast Promoter physicochemical CNN branch.
+        # Yeast Promoter physicochemical CNN branch. use_physchem_property_gate
+        # is an independent toggle - see model/physicochemical_branch.py.
+        # Defaults False (unchanged).
         self.physchem_branch = CNNNet_PhyChemDi(
-            dropout_prob=physchem_dropout_prob
+            dropout_prob=physchem_dropout_prob,
+            use_property_gate=use_physchem_property_gate,
         )
 
         # Gated fusion head instead of concatenation + one linear layer.

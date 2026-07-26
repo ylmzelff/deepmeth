@@ -18,14 +18,17 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# The deepmeth repo (PROJECT_ROOT) lives inside 1001_BioSeq_LLM/ on Google
-# Drive - synced locally via Drive desktop, mounted in Colab at
-# /content/drive/MyDrive/1001_BioSeq_LLM/deepmeth. PROJECT_ROOT.parent
-# resolves to that same 1001_BioSeq_LLM/ folder in both environments, so no
-# environment-specific branching is needed. The large pipeline data (splits,
-# extracted features, graph) lives in the sibling 1001_BioSeq_LLM/data/
-# folder, flat (no intermediate "features" subfolder) - not inside the repo.
-DATA_DIR = PROJECT_ROOT.parent / "data"
+# Locally (Windows, Drive desktop sync) the deepmeth repo lives inside
+# 1001_BioSeq_LLM/, so PROJECT_ROOT.parent is the data root. In Colab the
+# repo is instead git-cloned to /content/deepmeth - a separate location from
+# where Drive gets mounted (/content/drive/MyDrive/1001_BioSeq_LLM) - so
+# PROJECT_ROOT.parent is wrong there (resolves to /content). Prefer the
+# Colab Drive mount path when it exists; otherwise fall back to the local
+# sibling-of-repo layout. The large pipeline data (splits, extracted
+# features, graph) lives flat under this data/ root (no intermediate
+# "features" subfolder) - not inside the repo.
+_COLAB_DRIVE_DATA_DIR = Path("/content/drive/MyDrive/1001_BioSeq_LLM/data")
+DATA_DIR = _COLAB_DRIVE_DATA_DIR if _COLAB_DRIVE_DATA_DIR.exists() else PROJECT_ROOT.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 REFERENCE_DIR = DATA_DIR / "reference"
 DATASET_DIR = DATA_DIR / "proceed"  # train.parquet / validation.parquet / test.parquet
@@ -184,7 +187,7 @@ PHYSCHEM_DROPOUT = 0.5
 DECISION_THRESHOLD = 0.5
 EARLY_STOPPING_PATIENCE = 7
 EARLY_STOPPING_MIN_DELTA = 1e-5
-NUM_WORKERS = 4
+NUM_WORKERS = 2
 TRAINING_SEED = 42
 
 # "auto" computes pos_weight = n_negative / n_positive from the TRAIN split only;
@@ -193,8 +196,13 @@ POS_WEIGHT_MODE = "auto"
 
 # Shards are read in shuffled order and fed into a shuffle buffer (npz shards
 # are compressed, so they aren't randomly-indexable - this is the standard
-# shard-streaming shuffle pattern). ~2 shards worth of rows.
-SHUFFLE_BUFFER_SIZE = 100_000
+# shard-streaming shuffle pattern). Each DataLoader worker keeps its own
+# buffer, so peak RAM is roughly NUM_WORKERS * SHUFFLE_BUFFER_SIZE * bytes
+# per sample (~32KB with both sequence one-hot and physicochemical
+# decoded) - at the previous 4 workers * 100,000 that was ~13GB, enough to
+# OOM-kill a DataLoader worker on a standard Colab instance. ~1 shard worth
+# of rows at the current NUM_WORKERS=2.
+SHUFFLE_BUFFER_SIZE = 50_000
 
 # How often (wall-clock seconds, not batch count - stays meaningful if
 # BATCH_SIZE changes) to print in-epoch progress during training/validation.
