@@ -18,16 +18,21 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DATA_DIR = PROJECT_ROOT / "data"
+# The deepmeth repo (PROJECT_ROOT) lives inside 1001_BioSeq_LLM/ on Google
+# Drive - synced locally via Drive desktop, mounted in Colab at
+# /content/drive/MyDrive/1001_BioSeq_LLM/deepmeth. PROJECT_ROOT.parent
+# resolves to that same 1001_BioSeq_LLM/ folder in both environments, so no
+# environment-specific branching is needed. The large pipeline data (splits,
+# extracted features, graph) lives in the sibling 1001_BioSeq_LLM/data/
+# folder, flat (no intermediate "features" subfolder) - not inside the repo.
+DATA_DIR = PROJECT_ROOT.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 REFERENCE_DIR = DATA_DIR / "reference"
-PROCESSED_DIR = DATA_DIR / "processed"
-DATASET_DIR = PROCESSED_DIR / "dataset"  # train.parquet / validation.parquet / test.parquet
+DATASET_DIR = DATA_DIR / "proceed"  # train.parquet / validation.parquet / test.parquet
 
-FEATURES_DIR = DATA_DIR / "features"
-PHYSICOCHEMICAL_FEATURES_DIR = FEATURES_DIR / "physicochemical"
-SEQUENCE_CODES_DIR = FEATURES_DIR / "sequence_codes"
-DNABERT_NODE_FEATURES_DIR = FEATURES_DIR / "dnabert2_node_features"
+PHYSICOCHEMICAL_FEATURES_DIR = DATA_DIR / "physicochemical"
+SEQUENCE_CODES_DIR = DATA_DIR / "sequence_codes"
+DNABERT_NODE_FEATURES_DIR = DATA_DIR / "dnabert2_node_features"
 
 GRAPH_DIR = DATA_DIR / "graph"
 HIC_RAW_DIR = DATA_DIR / "hic" / "raw"
@@ -35,7 +40,9 @@ HIC_RAW_DIR = DATA_DIR / "hic" / "raw"
 RESULTS_DIR = PROJECT_ROOT / "results"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 
-PHYSICOCHEMICAL_PROPERTY_FILE = DATA_DIR / "Physicochemical_properties_Di.xlsx"
+# Small static reference table (not a generated pipeline artifact) - stays
+# inside the repo itself rather than the Drive-mounted data/ folder.
+PHYSICOCHEMICAL_PROPERTY_FILE = PROJECT_ROOT / "data" / "Physicochemical_properties_Di.xlsx"
 
 # ============================================================
 # ENCODE data sources — HepG2, GRCh38 (verified live via the ENCODE API)
