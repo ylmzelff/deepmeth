@@ -210,10 +210,17 @@ class DeepMethShardDataset(IterableDataset):
                     yield sample
                     continue
 
-                buffer.append(sample)
-                if len(buffer) >= SHUFFLE_BUFFER_SIZE:
-                    pop_index = rng.integers(len(buffer))
-                    yield buffer.pop(pop_index)
+                if len(buffer) < SHUFFLE_BUFFER_SIZE:
+                    buffer.append(sample)
+                    continue
+
+                # Swap-in reservoir-style replacement: O(1) per sample. Popping a
+                # random index out of a 100k-element list (the previous approach)
+                # is O(n) per call because Python has to shift every element after
+                # it - at this buffer size that made streaming effectively hang.
+                swap_index = rng.integers(SHUFFLE_BUFFER_SIZE)
+                yield buffer[swap_index]
+                buffer[swap_index] = sample
 
         if self.shuffle:
             rng.shuffle(buffer)

@@ -16,8 +16,8 @@ class GCN_Structure(nn.Module):
         adj_input:
             Normalized Hi-C adjacency matrix [N, N]
 
-        index_input:
-            One-hot node selection matrix [B, N]
+        node_index:
+            Graph node index per sample [B] (long tensor)
 
     Output:
         Selected graph representations [B, 128]
@@ -51,7 +51,7 @@ class GCN_Structure(nn.Module):
         self,
         node_input: torch.Tensor,
         adj_input: torch.Tensor,
-        index_input: torch.Tensor,
+        node_index: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
@@ -61,8 +61,8 @@ class GCN_Structure(nn.Module):
             adj_input:
                 Normalized sparse adjacency [N, N].
 
-            index_input:
-                One-hot node selection matrix [B, N].
+            node_index:
+                Graph node index per sample [B] (long tensor).
 
         Returns:
             Graph features [B, 128].
@@ -96,13 +96,12 @@ class GCN_Structure(nn.Module):
             adj_input,
         )
 
-        # Original ncVarPred node-selection operation:
-        #
-        # [B, N] x [N, 128] -> [B, 128]
-        structure_output = torch.matmul(
-            index_input,
-            structure_output,
-        )
+        # Row-gather equivalent of the original ncVarPred one-hot
+        # node-selection matmul ([B, N] x [N, 128] -> [B, 128]), but O(B)
+        # instead of O(B x N): each sample's node is a single row lookup,
+        # not a full-width dot product against a mostly-zero one-hot row.
+        # Identical result, far less compute and memory traffic.
+        structure_output = structure_output[node_index]
 
         return structure_output
 

@@ -4,9 +4,10 @@ import torch.nn as nn
 from model.sequence_branch import DanQ_Sequence
 from model.graph_branch import GCN_Structure
 from model.physicochemical_branch import CNNNet_PhyChemDi
+from model.fusion import GatedFusion
 
 
-class DeepMethConcatenation(nn.Module):
+class DeepMethModel(nn.Module):
     """
     Three-branch DeepMeth model.
 
@@ -23,7 +24,11 @@ class DeepMethConcatenation(nn.Module):
         [B, 12, 500] -> [B, 480]
 
     Fusion:
-        925 + 128 + 480 = 1533
+        Gated fusion (see model/fusion.py) - each branch projected to a
+        shared dimension, combined with a learned per-feature gate over
+        the 3 modalities, then a small MLP head. Replaces the original
+        ncVarPred "concatenate + one linear layer" fusion; the three
+        branches themselves are unchanged.
 
     Output:
         Raw methylation logit [B, 1] (unnormalized - pass through
@@ -34,8 +39,11 @@ class DeepMethConcatenation(nn.Module):
     def __init__(
         self,
         physchem_dropout_prob: float,
+        fusion_projected_dim: int,
+        fusion_hidden_dim: int,
+        fusion_dropout_prob: float,
     ):
-        super(DeepMethConcatenation, self).__init__()
+        super(DeepMethModel, self).__init__()
 
         # ncVarPred DanQ-based sequence branch.
         self.sequence_branch = DanQ_Sequence()
@@ -48,17 +56,18 @@ class DeepMethConcatenation(nn.Module):
             dropout_prob=physchem_dropout_prob
         )
 
-        # Original ncVarPred model concatenates branch outputs
-        # and applies one fully connected prediction layer.
+        # Gated fusion head instead of concatenation + one linear layer.
         #
         # Sequence:        925
         # Structure:       128
         # Physicochemical: 480
-        #
-        # Total:          1533
-        self.fc2 = nn.Linear(
-            925 + 128 + 480,
-            1,
+        self.fusion = GatedFusion(
+            sequence_dim=925,
+            graph_dim=128,
+            physchem_dim=480,
+            projected_dim=fusion_projected_dim,
+            hidden_dim=fusion_hidden_dim,
+            dropout_prob=fusion_dropout_prob,
         )
 
         # No sigmoid here - the model returns a raw logit. Training uses
@@ -73,7 +82,7 @@ class DeepMethConcatenation(nn.Module):
         seq_input: torch.Tensor,
         node_input: torch.Tensor,
         adj_input: torch.Tensor,
-        index_input: torch.Tensor,
+        node_index: torch.Tensor,
         physchem_input: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -87,8 +96,8 @@ class DeepMethConcatenation(nn.Module):
             adj_input:
                 Normalized Hi-C adjacency matrix [N, N].
 
-            index_input:
-                One-hot graph node selection matrix [B, N].
+            node_index:
+                Graph node index per sample [B] (long tensor).
 
             physchem_input:
                 Physicochemical feature matrix [B, 12, 500].
@@ -102,11 +111,11 @@ class DeepMethConcatenation(nn.Module):
             seq_input
         )
 
-        # [N, 768], [N, N], [B, N] -> [B, 128]
+        # [N, 768], [N, N], [B] -> [B, 128]
         structure_output = self.structure_branch(
             node_input=node_input,
             adj_input=adj_input,
-            index_input=index_input,
+            node_index=node_index,
         )
 
         # [B, 12, 500] -> [B, 480]
@@ -114,23 +123,11 @@ class DeepMethConcatenation(nn.Module):
             physchem_input
         )
 
-        # Original concatenation operation extended
-        # from two branches to three branches.
-        #
-        # [B, 925] + [B, 128] + [B, 480]
-        # -> [B, 1533]
-        concatenated_output = torch.cat(
-            (
-                seq_output,
-                structure_output,
-                physchem_output,
-            ),
-            dim=1,
-        )
-
-        # [B, 1533] -> [B, 1]
-        output = self.fc2(
-            concatenated_output
+        # Gated fusion: [B, 925] + [B, 128] + [B, 480] -> [B, 1]
+        output = self.fusion(
+            seq_output,
+            structure_output,
+            physchem_output,
         )
 
         return output

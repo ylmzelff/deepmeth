@@ -29,7 +29,6 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
@@ -46,8 +45,12 @@ from config.project_config import (
     EARLY_STOPPING_MIN_DELTA,
     EARLY_STOPPING_PATIENCE,
     EPOCHS,
+    FUSION_DROPOUT,
+    FUSION_HIDDEN_DIM,
+    FUSION_PROJECTED_DIM,
     GRAPH_DIR,
     LEARNING_RATE,
+    LOG_INTERVAL_SECONDS,
     NUM_WORKERS,
     PHYSCHEM_DROPOUT,
     POS_WEIGHT_MODE,
@@ -55,7 +58,7 @@ from config.project_config import (
     TRAINING_SEED,
     WEIGHT_DECAY,
 )
-from model.deepmeth_model import DeepMethConcatenation
+from model.deepmeth_model import DeepMethModel
 from training.dataset import DeepMethShardDataset, collate_batch
 
 NODE_FEATURES_PATH = GRAPH_DIR / "node_features.npy"
@@ -78,7 +81,7 @@ def load_graph_tensors(device: torch.device) -> tuple[torch.Tensor, torch.Tensor
         raise FileNotFoundError(f"{ADJACENCY_PATH} does not exist. Run feature_extraction/prepare_hic_graph.py first.")
 
     node_features = np.load(NODE_FEATURES_PATH)
-    adjacency = sp.load_npz(ADJACENCY_PATH).tocoo()
+    adjacency = sp.load_npz(ADJACENCY_PATH).tocsr()
 
     if node_features.shape[0] != adjacency.shape[0]:
         raise RuntimeError(
@@ -90,11 +93,16 @@ def load_graph_tensors(device: torch.device) -> tuple[torch.Tensor, torch.Tensor
 
     node_features_tensor = torch.from_numpy(node_features).float().to(device)
 
-    indices = torch.tensor(np.vstack([adjacency.row, adjacency.col]), dtype=torch.long)
-    values = torch.tensor(adjacency.data, dtype=torch.float32)
-    adjacency_tensor = torch.sparse_coo_tensor(
-        indices, values, size=adjacency.shape
-    ).coalesce().to(device)
+    # CSR instead of COO for the sparse adjacency: torch.spmm (used inside
+    # GraphConvolution) on a CSR tensor uses a much better-optimized CUDA
+    # kernel than COO for repeated matmuls against a fixed sparse structure -
+    # same math (bit-for-bit equivalent), just a faster storage format.
+    adjacency_tensor = torch.sparse_csr_tensor(
+        torch.tensor(adjacency.indptr, dtype=torch.int64),
+        torch.tensor(adjacency.indices, dtype=torch.int64),
+        torch.tensor(adjacency.data, dtype=torch.float32),
+        size=adjacency.shape,
+    ).to(device)
 
     return node_features_tensor, adjacency_tensor, number_of_nodes
 
@@ -134,18 +142,23 @@ def run_epoch(
     loader: DataLoader,
     node_features: torch.Tensor,
     adjacency: torch.Tensor,
-    number_of_nodes: int,
     criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    phase_name: str,
 ) -> dict:
     is_training = optimizer is not None
     model.train(is_training)
+
+    total_rows_in_split = len(loader.dataset)
 
     total_loss = 0.0
     total_samples = 0
     all_probabilities = []
     all_labels = []
+
+    epoch_start_time = time.time()
+    last_log_time = epoch_start_time
 
     with torch.set_grad_enabled(is_training):
         for batch in loader:
@@ -154,13 +167,11 @@ def run_epoch(
             node_index = batch["node_index"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
-            index_input = F.one_hot(node_index, num_classes=number_of_nodes).float()
-
             logits = model(
                 seq_input=sequence_input,
                 node_input=node_features,
                 adj_input=adjacency,
-                index_input=index_input,
+                node_index=node_index,
                 physchem_input=physchem_input,
             ).squeeze(1)
 
@@ -177,6 +188,20 @@ def run_epoch(
 
             all_probabilities.append(torch.sigmoid(logits).detach().cpu().numpy())
             all_labels.append(labels.detach().cpu().numpy())
+
+            now = time.time()
+            if now - last_log_time >= LOG_INTERVAL_SECONDS:
+                elapsed = now - epoch_start_time
+                throughput = total_samples / elapsed
+                remaining_rows = total_rows_in_split - total_samples
+                eta_minutes = (remaining_rows / throughput) / 60 if throughput > 0 else float("nan")
+
+                print(
+                    f"  [{phase_name}] {total_samples:,}/{total_rows_in_split:,} rows | "
+                    f"running_loss={total_loss / total_samples:.4f} | "
+                    f"{throughput:.0f} rows/s | elapsed {elapsed / 60:.1f}min | ETA {eta_minutes:.1f}min"
+                )
+                last_log_time = now
 
     probabilities = np.concatenate(all_probabilities)
     labels_array = np.concatenate(all_labels)
@@ -222,7 +247,12 @@ def main() -> None:
     pos_weight = resolve_pos_weight(train_dataset)
 
     print("\n[3/4] Building model")
-    model = DeepMethConcatenation(physchem_dropout_prob=PHYSCHEM_DROPOUT).to(device)
+    model = DeepMethModel(
+        physchem_dropout_prob=PHYSCHEM_DROPOUT,
+        fusion_projected_dim=FUSION_PROJECTED_DIM,
+        fusion_hidden_dim=FUSION_HIDDEN_DIM,
+        fusion_dropout_prob=FUSION_DROPOUT,
+    ).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
@@ -247,12 +277,14 @@ def main() -> None:
 
         train_dataset.set_epoch(epoch)
         train_metrics = run_epoch(
-            model, train_loader, node_features, adjacency, number_of_nodes, criterion, device, optimizer
+            model, train_loader, node_features, adjacency, criterion, device, optimizer,
+            phase_name="train",
         )
 
         validation_dataset.set_epoch(epoch)
         validation_metrics = run_epoch(
-            model, validation_loader, node_features, adjacency, number_of_nodes, criterion, device, None
+            model, validation_loader, node_features, adjacency, criterion, device, None,
+            phase_name="validation",
         )
 
         epoch_duration = time.time() - epoch_start

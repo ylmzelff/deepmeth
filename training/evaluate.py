@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
@@ -28,8 +28,18 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from config.project_config import CHECKPOINT_DIR, DEVICE, PHYSCHEM_DROPOUT, RESULTS_DIR, TRAINING_SEED
-from model.deepmeth_model import DeepMethConcatenation
+from config.project_config import (
+    CHECKPOINT_DIR,
+    DEVICE,
+    FUSION_DROPOUT,
+    FUSION_HIDDEN_DIM,
+    FUSION_PROJECTED_DIM,
+    LOG_INTERVAL_SECONDS,
+    PHYSCHEM_DROPOUT,
+    RESULTS_DIR,
+    TRAINING_SEED,
+)
+from model.deepmeth_model import DeepMethModel
 from training.dataset import collate_batch, DeepMethShardDataset
 from training.train import build_loader, load_graph_tensors
 
@@ -42,13 +52,18 @@ def evaluate(
     loader: torch.utils.data.DataLoader,
     node_features: torch.Tensor,
     adjacency: torch.Tensor,
-    number_of_nodes: int,
     device: torch.device,
 ) -> dict:
     model.eval()
 
+    total_rows_in_split = len(loader.dataset)
+    total_samples = 0
+
     all_probabilities = []
     all_labels = []
+
+    start_time = time.time()
+    last_log_time = start_time
 
     with torch.no_grad():
         for batch in loader:
@@ -57,18 +72,31 @@ def evaluate(
             node_index = batch["node_index"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
-            index_input = F.one_hot(node_index, num_classes=number_of_nodes).float()
-
             logits = model(
                 seq_input=sequence_input,
                 node_input=node_features,
                 adj_input=adjacency,
-                index_input=index_input,
+                node_index=node_index,
                 physchem_input=physchem_input,
             ).squeeze(1)
 
             all_probabilities.append(torch.sigmoid(logits).detach().cpu().numpy())
             all_labels.append(labels.detach().cpu().numpy())
+
+            total_samples += labels.shape[0]
+
+            now = time.time()
+            if now - last_log_time >= LOG_INTERVAL_SECONDS:
+                elapsed = now - start_time
+                throughput = total_samples / elapsed
+                remaining_rows = total_rows_in_split - total_samples
+                eta_minutes = (remaining_rows / throughput) / 60 if throughput > 0 else float("nan")
+
+                print(
+                    f"  [test] {total_samples:,}/{total_rows_in_split:,} rows | "
+                    f"{throughput:.0f} rows/s | elapsed {elapsed / 60:.1f}min | ETA {eta_minutes:.1f}min"
+                )
+                last_log_time = now
 
     probabilities = np.concatenate(all_probabilities)
     labels_array = np.concatenate(all_labels)
@@ -115,12 +143,17 @@ def main() -> None:
     print("\n[3/3] Loading best checkpoint and evaluating")
     checkpoint = torch.load(BEST_CHECKPOINT_PATH, map_location=device)
 
-    model = DeepMethConcatenation(physchem_dropout_prob=PHYSCHEM_DROPOUT).to(device)
+    model = DeepMethModel(
+        physchem_dropout_prob=PHYSCHEM_DROPOUT,
+        fusion_projected_dim=FUSION_PROJECTED_DIM,
+        fusion_hidden_dim=FUSION_HIDDEN_DIM,
+        fusion_dropout_prob=FUSION_DROPOUT,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     print(f"Checkpoint from epoch {checkpoint['epoch']}, validation metrics: {checkpoint['validation_metrics']}")
 
-    metrics = evaluate(model, test_loader, node_features, adjacency, number_of_nodes, device)
+    metrics = evaluate(model, test_loader, node_features, adjacency, device)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 

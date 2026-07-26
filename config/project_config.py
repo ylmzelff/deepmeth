@@ -153,11 +153,23 @@ FUSION_INPUT_DIM = (
 )  # 1533
 
 # ============================================================
+# Fusion head (gated, replaces plain concatenation + linear).
+# Each branch is projected to FUSION_PROJECTED_DIM, a per-feature gate
+# (softmax across the 3 modalities) is computed from the raw
+# concatenated branch outputs, and the gated projections are summed
+# before a small MLP head - see model/fusion.py.
+# ============================================================
+
+FUSION_PROJECTED_DIM = 256
+FUSION_HIDDEN_DIM = 128
+FUSION_DROPOUT = 0.3
+
+# ============================================================
 # Training hyperparameters (unchanged defaults from the previous project)
 # ============================================================
 
 EPOCHS = 50
-BATCH_SIZE = 16
+BATCH_SIZE = 4096
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-6
 L1_LAMBDA = 0.0
@@ -176,5 +188,9 @@ POS_WEIGHT_MODE = "auto"
 # are compressed, so they aren't randomly-indexable - this is the standard
 # shard-streaming shuffle pattern). ~2 shards worth of rows.
 SHUFFLE_BUFFER_SIZE = 100_000
+
+# How often (wall-clock seconds, not batch count - stays meaningful if
+# BATCH_SIZE changes) to print in-epoch progress during training/validation.
+LOG_INTERVAL_SECONDS = 30.0
 
 DEVICE = "cuda:0"
