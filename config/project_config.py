@@ -182,28 +182,12 @@ EPOCHS = 50
 BATCH_SIZE = 4096
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-6
-# ncVarPred's own training code (train_model_gcn.py) applies L1 on top of
-# Adam's L2/weight_decay, targeted specifically at the fusion (FC) and GCN
-# layers - not the conv/BiLSTM/physicochemical branches. Previously this
-# constant was defined but never wired into training/train.py (dead
-# config); now it's read there. 1e-5 is a conservative starting point (the
-# paper tuned this value per-run and didn't publish the exact number) -
-# treat it as a first guess to compare against L1_LAMBDA=0.0, not a
-# literature-matched value.
-L1_LAMBDA = 1e-5
+L1_LAMBDA = 0.0
 PHYSCHEM_DROPOUT = 0.5
 DECISION_THRESHOLD = 0.5
 EARLY_STOPPING_PATIENCE = 7
 EARLY_STOPPING_MIN_DELTA = 1e-5
-# 0: single-process data loading, no DataLoader worker subprocesses at all.
-# On TRUBA, worker processes restarting at the start of every epoch would
-# hang indefinitely (SLURM/filesystem-specific - same code ran fine on
-# Colab, so this isn't a bug in our multiprocessing usage, just something
-# about that cluster's process/filesystem handling we couldn't pin down
-# from here). num_workers=0 sidesteps the whole failure category since
-# there's no worker process to restart. Costs some throughput (no loading
-# parallelism) but that's far better than a job silently hanging for hours.
-NUM_WORKERS = 0
+NUM_WORKERS = 2
 TRAINING_SEED = 42
 
 # "auto" computes pos_weight = n_negative / n_positive from the TRAIN split only;
