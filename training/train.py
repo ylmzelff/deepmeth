@@ -49,6 +49,7 @@ from config.project_config import (
     FUSION_HIDDEN_DIM,
     FUSION_PROJECTED_DIM,
     GRAPH_DIR,
+    L1_LAMBDA,
     LEARNING_RATE,
     LOG_INTERVAL_SECONDS,
     NUM_WORKERS,
@@ -175,15 +176,31 @@ def run_epoch(
                 physchem_input=physchem_input,
             ).squeeze(1)
 
-            loss = criterion(logits, labels)
+            # This is what gets logged/compared across epochs and runs -
+            # kept free of the L1 penalty term below so metrics stay
+            # comparable regardless of L1_LAMBDA.
+            prediction_loss = criterion(logits, labels)
 
             if is_training:
+                training_loss = prediction_loss
+
+                if L1_LAMBDA > 0:
+                    # ncVarPred's own training code applies L1 specifically
+                    # to the fusion (FC) and GCN layers, not the conv/
+                    # BiLSTM/physicochemical branches - matched here.
+                    l1_penalty = sum(
+                        parameter.abs().sum()
+                        for module in (model.fusion, model.structure_branch)
+                        for parameter in module.parameters()
+                    )
+                    training_loss = training_loss + L1_LAMBDA * l1_penalty
+
                 optimizer.zero_grad()
-                loss.backward()
+                training_loss.backward()
                 optimizer.step()
 
             batch_size = labels.shape[0]
-            total_loss += loss.item() * batch_size
+            total_loss += prediction_loss.item() * batch_size
             total_samples += batch_size
 
             all_probabilities.append(torch.sigmoid(logits).detach().cpu().numpy())
