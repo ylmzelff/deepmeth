@@ -49,6 +49,7 @@ from config.project_config import (
     FUSION_HIDDEN_DIM,
     FUSION_PROJECTED_DIM,
     GRAPH_DIR,
+    L1_LAMBDA,
     LEARNING_RATE,
     LOG_INTERVAL_SECONDS,
     NUM_WORKERS,
@@ -66,6 +67,17 @@ ADJACENCY_PATH = GRAPH_DIR / "adjacency_normalized.npz"
 LAST_CHECKPOINT_PATH = CHECKPOINT_DIR / "last_checkpoint.pt"
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "best_model.pt"
 HISTORY_PATH = RESULTS_DIR / "training_history.json"
+
+# Optional warm start (ncVarPred paper: "part of the models were warm-started
+# with DNA sequence encoders ... initialized at the values from pretrained
+# sequence-only models"). Produced by training/pretrain_sequence.py. If this
+# file exists, its weights are loaded into the sequence branch before joint
+# training starts - not frozen, just a better starting point than random
+# init. Must have been pretrained with the same use_sequence_self_attention
+# setting as USE_SEQUENCE_SELF_ATTENTION below, or loading will fail on a
+# shape mismatch.
+SEQUENCE_BRANCH_WEIGHTS_PATH = CHECKPOINT_DIR / "sequence_branch_pretrained.pt"
+USE_SEQUENCE_SELF_ATTENTION = False
 
 
 def set_seed(seed: int) -> None:
@@ -133,6 +145,25 @@ def build_loader(split_name: str, shuffle: bool) -> tuple[DeepMethShardDataset, 
         collate_fn=collate_batch,
         num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
+        # "fork" (the Linux default) copies the parent process's memory,
+        # including its already-initialized CUDA context (node_features/
+        # adjacency are loaded onto the GPU before this loader is built) -
+        # forking a process with a live CUDA context is a known cause of
+        # silent worker hangs. "spawn" starts each worker as a brand-new
+        # Python process instead, so it never inherits that CUDA state.
+        # Slightly slower to start workers, but avoids this failure mode
+        # entirely - this is PyTorch's own recommended setting for
+        # CUDA + multiprocessing DataLoader.
+        multiprocessing_context="spawn" if NUM_WORKERS > 0 else None,
+        # Workers restart at the beginning of every epoch (persistent_workers
+        # isn't used - our IterableDataset reshuffles via set_epoch() each
+        # epoch, and persistent workers wouldn't pick that up correctly).
+        # On a shared HPC filesystem that restart can occasionally stall for
+        # a long time instead of just being slow. Without a timeout, a stall
+        # is silent and indistinguishable from "still working" - it can burn
+        # the whole SLURM walltime budget before anyone notices. With a
+        # timeout, a genuine stall raises a clear error instead.
+        timeout=600 if NUM_WORKERS > 0 else 0,
     )
     return dataset, loader
 
@@ -175,15 +206,31 @@ def run_epoch(
                 physchem_input=physchem_input,
             ).squeeze(1)
 
-            loss = criterion(logits, labels)
+            # This is what gets logged/compared across epochs and runs -
+            # kept free of the L1 penalty term below so metrics stay
+            # comparable regardless of L1_LAMBDA.
+            prediction_loss = criterion(logits, labels)
 
             if is_training:
+                training_loss = prediction_loss
+
+                if L1_LAMBDA > 0:
+                    # ncVarPred's own training code applies L1 specifically
+                    # to the fusion (FC) and GCN layers, not the conv/
+                    # BiLSTM/physicochemical branches - matched here.
+                    l1_penalty = sum(
+                        parameter.abs().sum()
+                        for module in (model.fusion, model.structure_branch)
+                        for parameter in module.parameters()
+                    )
+                    training_loss = training_loss + L1_LAMBDA * l1_penalty
+
                 optimizer.zero_grad()
-                loss.backward()
+                training_loss.backward()
                 optimizer.step()
 
             batch_size = labels.shape[0]
-            total_loss += loss.item() * batch_size
+            total_loss += prediction_loss.item() * batch_size
             total_samples += batch_size
 
             all_probabilities.append(torch.sigmoid(logits).detach().cpu().numpy())
@@ -252,7 +299,20 @@ def main() -> None:
         fusion_projected_dim=FUSION_PROJECTED_DIM,
         fusion_hidden_dim=FUSION_HIDDEN_DIM,
         fusion_dropout_prob=FUSION_DROPOUT,
+        use_sequence_self_attention=USE_SEQUENCE_SELF_ATTENTION,
     ).to(device)
+
+    if SEQUENCE_BRANCH_WEIGHTS_PATH.exists():
+        print(f"Warm-starting sequence branch from {SEQUENCE_BRANCH_WEIGHTS_PATH}")
+        model.sequence_branch.load_state_dict(
+            torch.load(SEQUENCE_BRANCH_WEIGHTS_PATH, map_location=device)
+        )
+    else:
+        print(
+            f"No warm-start weights at {SEQUENCE_BRANCH_WEIGHTS_PATH} - sequence branch starts "
+            "from random init (run training/pretrain_sequence.py first to enable warm-start)."
+        )
+
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
