@@ -1,8 +1,13 @@
 """
 Shard-streaming Dataset for the DeepMeth three-branch model.
 
-Sequence-code shards (feature_extraction/extract_sequence_codes.py) and
-physicochemical-code shards (feature_extraction/extract_physicochemical.py)
+Dataset-agnostic: every path comes from config.project_config's ACTIVE_*
+constants, which resolve off the single DATASET switch there ("HEPG2" or
+"GM12878"). This class itself never hardcodes either dataset - same
+logic, same file layout convention, just a different root directory.
+
+Sequence-code shards (feature_extraction/extract_sequence_codes*.py) and
+physicochemical-code shards (feature_extraction/extract_physicochemical*.py)
 share identical shard boundaries and row order - both are produced by
 iterating the same split parquet with the same batch size - so they are
 read in lockstep by shard index rather than joined by key at every step.
@@ -37,11 +42,12 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from config.project_config import (
-    GRAPH_DIR,
+    ACTIVE_GRAPH_DIR,
+    ACTIVE_PHYSICOCHEMICAL_DIR,
+    ACTIVE_SEQUENCE_CODES_DIR,
+    ACTIVE_SPLIT_NODE_INDEX_DIR,
     GRAPH_RESOLUTION,
-    PHYSICOCHEMICAL_FEATURES_DIR,
     PHYSICOCHEMICAL_PROPERTY_FILE,
-    SEQUENCE_CODES_DIR,
     SHUFFLE_BUFFER_SIZE,
 )
 from feature_extraction.extract_physicochemical import (
@@ -50,7 +56,7 @@ from feature_extraction.extract_physicochemical import (
 )
 from feature_extraction.extract_sequence_codes import expand_codes_to_one_hot
 
-NODE_INDEX_PATH = GRAPH_DIR / "node_index.parquet"
+NODE_INDEX_PATH = ACTIVE_GRAPH_DIR / "node_index.parquet"
 
 
 class DeepMethShardDataset(IterableDataset):
@@ -61,8 +67,8 @@ class DeepMethShardDataset(IterableDataset):
         self.seed = seed
         self.epoch = 0
 
-        self.physchem_dir = PHYSICOCHEMICAL_FEATURES_DIR / split_name
-        self.sequence_dir = SEQUENCE_CODES_DIR / split_name
+        self.physchem_dir = ACTIVE_PHYSICOCHEMICAL_DIR / split_name
+        self.sequence_dir = ACTIVE_SEQUENCE_CODES_DIR / split_name
 
         with (self.physchem_dir / "manifest.json").open(encoding="utf-8") as file:
             self.physchem_manifest = json.load(file)
@@ -78,10 +84,10 @@ class DeepMethShardDataset(IterableDataset):
 
         self.property_table = load_physicochemical_properties_di(PHYSICOCHEMICAL_PROPERTY_FILE)
 
-        node_index_path = GRAPH_DIR / f"{split_name}_node_index.npy"
+        node_index_path = ACTIVE_SPLIT_NODE_INDEX_DIR / f"{split_name}_node_index.npy"
         if not node_index_path.exists():
             raise FileNotFoundError(
-                f"{node_index_path} does not exist. Run feature_extraction/prepare_graph_features.py first."
+                f"{node_index_path} does not exist. Run the matching prepare_graph_features script first."
             )
         self.node_index_array = np.load(node_index_path)
 
@@ -162,8 +168,8 @@ class DeepMethShardDataset(IterableDataset):
             if not np.array_equal(recomputed_node_indices, precomputed_node_indices):
                 raise RuntimeError(
                     f"{self.split_name} shard {shard_index}: recomputed graph node indices don't match "
-                    f"{self.split_name}_node_index.npy - out of sync, rerun "
-                    "feature_extraction/prepare_graph_features.py."
+                    f"{self.split_name}_node_index.npy - out of sync, rerun the matching "
+                    "prepare_graph_features script."
                 )
 
             positive_count += int(labels.sum())
@@ -220,8 +226,8 @@ class DeepMethShardDataset(IterableDataset):
                 # copies). Without copying, every sample sitting in the shuffle
                 # buffer keeps its entire parent shard array alive - with shuffling
                 # scattering live references across many different shards at once,
-                # this pins ~1.6GB per shard in memory for as long as any one of its
-                # rows remains buffered, which OOM-kills the worker after ~15 shards.
+                # this pins the whole shard in memory for as long as any one of its
+                # rows remains buffered, which OOM-kills the worker after enough shards.
                 sample = (one_hot[row].copy(), physchem_matrix[row].copy(), int(node_indices[row]), int(labels[row]))
 
                 if not self.shuffle:
@@ -232,10 +238,6 @@ class DeepMethShardDataset(IterableDataset):
                     buffer.append(sample)
                     continue
 
-                # Swap-in reservoir-style replacement: O(1) per sample. Popping a
-                # random index out of a 100k-element list (the previous approach)
-                # is O(n) per call because Python has to shift every element after
-                # it - at this buffer size that made streaming effectively hang.
                 swap_index = rng.integers(SHUFFLE_BUFFER_SIZE)
                 yield buffer[swap_index]
                 buffer[swap_index] = sample

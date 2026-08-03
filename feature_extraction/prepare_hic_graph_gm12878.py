@@ -1,0 +1,145 @@
+"""
+Build the 100kb-resolution Hi-C graph for GM12878/hg19 - the
+architecture-validation counterpart to feature_extraction/prepare_hic_graph.py
+(HepG2/GRCh38). Same graph construction (node index + normalized adjacency),
+different genome build and raw .hic file.
+
+Reuses build_raw_adjacency/normalize_adjacency/normalize_chromosome_name from
+prepare_hic_graph.py unchanged (genome-agnostic: they take the .hic file
+handle and node index as arguments, no hardcoded HepG2/GRCh38 path inside).
+Only build_node_index is redefined locally, since the original hardcodes
+HIC_RAW_FILE_PATH (HepG2's GRCh38 .hic) - here it points at
+GM12878_HIC_RAW_FILE_PATH (hg19) instead.
+
+Requires `pip install hic-straw` and download_data_gm12878.py to have run.
+
+Usage (no arguments needed):
+
+    python feature_extraction/prepare_hic_graph_gm12878.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import hicstraw
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+
+from config.project_config import GRAPH_RESOLUTION, INCLUDED_CHROMOSOMES
+from feature_extraction.prepare_hic_graph import build_raw_adjacency, normalize_adjacency
+from preprocessing.download_data_gm12878 import GM12878_DATA_DIR, GM12878_HIC_RAW_FILE_PATH
+
+GM12878_GRAPH_DIR = GM12878_DATA_DIR / "graph"
+NODE_INDEX_PATH = GM12878_GRAPH_DIR / "node_index.parquet"
+ADJACENCY_PATH = GM12878_GRAPH_DIR / "adjacency_normalized.npz"
+
+
+def normalize_chromosome_name(name: str) -> str:
+    """Local copy of prepare_hic_graph.py's version - trivial enough that
+    importing it would only save a few lines, and keeping it local avoids
+    any confusion about which genome build a shared helper implicitly
+    assumes."""
+    name = str(name).strip()
+    suffix = name[3:] if name.lower().startswith("chr") else name
+    if suffix.lower() == "x":
+        suffix = "X"
+    elif suffix.lower() == "y":
+        suffix = "Y"
+    elif suffix.lower() in {"m", "mt"}:
+        suffix = "M"
+    return f"chr{suffix}"
+
+
+def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile", dict[str, str]]:
+    """One row per 100kb bin across chr1-22 + chrX (hg19 lengths), in a fixed
+    global order. Also returns a {normalized_name: raw_name} map, since .hic
+    files vary in whether they store chromosomes as "chr1" or "1"."""
+    hic_file = hicstraw.HiCFile(str(GM12878_HIC_RAW_FILE_PATH))
+
+    available_resolutions = hic_file.getResolutions()
+    print(f"Resolutions available in the .hic file: {available_resolutions}")
+
+    if GRAPH_RESOLUTION not in available_resolutions:
+        raise RuntimeError(
+            f"{GRAPH_RESOLUTION:,} bp is not one of the resolutions stored in this .hic file: "
+            f"{available_resolutions}. Pick one of those instead (GRAPH_RESOLUTION in config)."
+        )
+
+    raw_names: dict[str, str] = {}
+    chrom_lengths: dict[str, int] = {}
+
+    for chrom in hic_file.getChromosomes():
+        normalized = normalize_chromosome_name(chrom.name)
+        if normalized in INCLUDED_CHROMOSOMES:
+            raw_names[normalized] = chrom.name
+            chrom_lengths[normalized] = chrom.length
+
+    missing = set(INCLUDED_CHROMOSOMES) - set(chrom_lengths)
+    if missing:
+        raise RuntimeError(
+            f"The .hic file is missing expected chromosomes: {sorted(missing)}. "
+            "Check that it is really hg19 with chr1-22 + chrX."
+        )
+
+    print("Chromosome lengths from the .hic file (normalized name <- raw name in file):")
+    for chrom in INCLUDED_CHROMOSOMES:
+        print(f"  {chrom} <- {raw_names[chrom]!r}: {chrom_lengths[chrom]:,} bp")
+
+    rows = []
+    for chrom in INCLUDED_CHROMOSOMES:
+        length = chrom_lengths[chrom]
+        for bin_start in range(0, length, GRAPH_RESOLUTION):
+            bin_end = min(bin_start + GRAPH_RESOLUTION, length)
+            rows.append({"chrom": chrom, "bin_start": bin_start, "bin_end": bin_end})
+
+    node_index = pd.DataFrame(rows)
+    node_index["node_index"] = np.arange(len(node_index), dtype=np.int64)
+
+    duplicate_count = int(node_index.duplicated(subset=["chrom", "bin_start"]).sum())
+    if duplicate_count:
+        raise RuntimeError(f"{duplicate_count} duplicate (chrom, bin_start) bins in the node index.")
+
+    return node_index, hic_file, raw_names
+
+
+def main() -> None:
+    print("=" * 70)
+    print("Building the GM12878 100kb Hi-C graph (hg19)")
+    print("=" * 70)
+    print(f"Source: {GM12878_HIC_RAW_FILE_PATH}")
+    print(f"Resolution: {GRAPH_RESOLUTION:,} bp")
+
+    GM12878_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("\n[1/3] Building node index")
+    node_index, hic_file, raw_names = build_node_index()
+    print(f"Total nodes: {len(node_index):,}")
+
+    node_index.to_parquet(NODE_INDEX_PATH, index=False)
+    print(f"Saved: {NODE_INDEX_PATH}")
+
+    print("\n[2/3] Reading intra-chromosomal Hi-C contacts")
+    raw_adjacency = build_raw_adjacency(node_index, hic_file, raw_names)
+    print(f"Raw adjacency non-zero entries: {raw_adjacency.nnz:,}")
+
+    print("\n[3/3] Normalizing adjacency (self-loops + symmetric degree norm)")
+    normalized_adjacency = normalize_adjacency(raw_adjacency)
+
+    if not np.isfinite(normalized_adjacency.data).all():
+        raise RuntimeError("Normalized adjacency contains NaN or infinite values.")
+
+    sp.save_npz(ADJACENCY_PATH, normalized_adjacency)
+    print(f"Saved: {ADJACENCY_PATH}")
+
+    print("\nGM12878 Hi-C graph construction completed.")
+    print(f"Nodes: {len(node_index):,}")
+    print(f"Adjacency non-zero entries (post-normalization): {normalized_adjacency.nnz:,}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,32 +1,11 @@
-"""Central configuration for the DeepMeth pipeline (HepG2, GRCh38).
-
-Every stage script imports its paths and hyperparameters from here instead of
-defining its own defaults, so a Colab cell only needs to run:
-
-    !python preprocessing/preprocess.py
-
-with no arguments.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
 
-# ============================================================
-# Project paths
-# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Locally (Windows, Drive desktop sync) the deepmeth repo lives inside
-# 1001_BioSeq_LLM/, so PROJECT_ROOT.parent is the data root. In Colab the
-# repo is instead git-cloned to /content/deepmeth - a separate location from
-# where Drive gets mounted (/content/drive/MyDrive/1001_BioSeq_LLM) - so
-# PROJECT_ROOT.parent is wrong there (resolves to /content). Prefer the
-# Colab Drive mount path when it exists; otherwise fall back to the local
-# sibling-of-repo layout. The large pipeline data (splits, extracted
-# features, graph) lives flat under this data/ root (no intermediate
-# "features" subfolder) - not inside the repo.
+
 _COLAB_DRIVE_DATA_DIR = Path("/content/drive/MyDrive/1001_BioSeq_LLM/data")
 DATA_DIR = _COLAB_DRIVE_DATA_DIR if _COLAB_DRIVE_DATA_DIR.exists() else PROJECT_ROOT.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
@@ -86,10 +65,6 @@ HIC_RAW_FILE_PATH = HIC_RAW_DIR / f"{HIC_FILE_ACCESSION}.hic"
 SEQUENCE_LENGTH = 501
 CENTER_INDEX = SEQUENCE_LENGTH // 2  # 250
 MAX_UNKNOWN_FRACTION = 0.10
-
-# One-hot base order for the sequence branch; index i is channel i of the
-# [4, 501] one-hot input. "N" (and anything else) gets UNKNOWN_BASE_CODE,
-# expanded to an all-zero one-hot column at load time.
 BASE_ORDER = "ACGT"
 UNKNOWN_BASE_CODE = 4
 
@@ -118,10 +93,6 @@ INCLUDED_CHROMOSOMES = AUTOSOME_CHROMOSOMES + ["chrX"]  # chrY / chrM excluded
 
 PHYSICOCHEMICAL_MATRIX_SHAPE = (12, SEQUENCE_LENGTH - 1)  # [12, 500]
 PHYSICOCHEMICAL_CNN_OUTPUT_DIM = 480
-
-# Rows per shard file. At this scale (tens of millions of CpGs) a small
-# shard size would create tens of thousands of tiny files; 50k keeps shard
-# count reasonable (~430 shards for a 21M-row split) at ~500MB/shard.
 PHYSICOCHEMICAL_SHARD_SIZE = 50_000
 
 # ============================================================
@@ -133,13 +104,7 @@ GRAPH_INTRA_CHROMOSOME_ONLY = True  # inter-chromosomal contacts set to 0 (tract
 NODE_FEATURE_DIM = 768  # DNABERT-2 hidden size
 
 # ============================================================
-# DNABERT-2 (model/tokenizer settings unchanged). Embedding every one of
-# the ~26.5M CpGs individually was projected to take ~15+ hours and isn't
-# actually needed: the graph branch only ever consumes one pooled feature
-# per 100kb node, not a per-CpG embedding. So we embed only a deterministic
-# sample of up to DNABERT_MAX_CPG_PER_NODE CpGs per node (drawn from
-# train+validation+test combined - see [[dnabert_node_feature_sampling]])
-# and mean-pool those into the node feature.
+# DNABERT-2 (model/tokenizer settings unchanged)
 # ============================================================
 
 DNABERT_MODEL_NAME = "zhihan1996/DNABERT-2-117M"
@@ -154,21 +119,22 @@ DNABERT_MAX_CPG_PER_NODE = 64
 # Model architecture dimensions (fixed — ported as-is, do not change)
 # ============================================================
 
+# Must be the same value everywhere DeepMethModel(use_sequence_self_attention=...)
+# is constructed, and everywhere a sequence-branch checkpoint is loaded into
+# or out of that argument - the saved state_dict's shapes depend on which
+# internal architecture (BiLSTM vs self-attention) was used. Living here
+# (one place) instead of being duplicated as a local constant in each
+# training script is what makes that "must match" guarantee actually hold.
+# BiLSTM (False) won the GM12878 ablation - see project history.
+USE_SEQUENCE_SELF_ATTENTION = False
+
 SEQUENCE_BRANCH_OUTPUT_DIM = 925
 GRAPH_BRANCH_OUTPUT_DIM = 128
 FUSION_INPUT_DIM = (
     SEQUENCE_BRANCH_OUTPUT_DIM
     + GRAPH_BRANCH_OUTPUT_DIM
     + PHYSICOCHEMICAL_CNN_OUTPUT_DIM
-)  # 1533
-
-# ============================================================
-# Fusion head (gated, replaces plain concatenation + linear).
-# Each branch is projected to FUSION_PROJECTED_DIM, a per-feature gate
-# (softmax across the 3 modalities) is computed from the raw
-# concatenated branch outputs, and the gated projections are summed
-# before a small MLP head - see model/fusion.py.
-# ============================================================
+)  
 
 FUSION_PROJECTED_DIM = 256
 FUSION_HIDDEN_DIM = 128
@@ -178,48 +144,114 @@ FUSION_DROPOUT = 0.3
 # Training hyperparameters (unchanged defaults from the previous project)
 # ============================================================
 
-EPOCHS = 50
-BATCH_SIZE = 4096
+EPOCHS = 100
+BATCH_SIZE = 1024
 LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-6
-# ncVarPred's own training code (train_model_gcn.py) applies L1 on top of
-# Adam's L2/weight_decay, targeted specifically at the fusion (FC) and GCN
-# layers - not the conv/BiLSTM/physicochemical branches. 1e-5 (the first
-# guess) turned out too aggressive in a synthetic test (~40% of
-# prediction_loss); 1e-6 is the recalibrated, more conservative value being
-# tried now.
+WEIGHT_DECAY = 1e-4
 L1_LAMBDA = 1e-6
+GRAD_CLIP_MAX_NORM = 1.0
+LR_SCHEDULER_FACTOR = 0.5
+LR_SCHEDULER_PATIENCE = 1
+LR_SCHEDULER_MIN_LR = 1e-6
 PHYSCHEM_DROPOUT = 0.5
 DECISION_THRESHOLD = 0.5
-EARLY_STOPPING_PATIENCE = 7
+EARLY_STOPPING_PATIENCE = 20
 EARLY_STOPPING_MIN_DELTA = 1e-5
-# 0: single-process data loading, no DataLoader worker subprocesses at all.
-# On TRUBA, worker processes restarting at the start of every epoch would
-# hang indefinitely (SLURM/filesystem-specific - same code ran fine on
-# Colab, so this isn't a bug in our multiprocessing usage, just something
-# about that cluster's process/filesystem handling we couldn't pin down
-# from here). num_workers=0 sidesteps the whole failure category since
-# there's no worker process to restart. Costs some throughput (no loading
-# parallelism) but that's far better than a job silently hanging for hours.
 NUM_WORKERS = 0
 TRAINING_SEED = 42
-
-# "auto" computes pos_weight = n_negative / n_positive from the TRAIN split only;
-# pass a float instead to override.
 POS_WEIGHT_MODE = "auto"
-
-# Shards are read in shuffled order and fed into a shuffle buffer (npz shards
-# are compressed, so they aren't randomly-indexable - this is the standard
-# shard-streaming shuffle pattern). Each DataLoader worker keeps its own
-# buffer, so peak RAM is roughly NUM_WORKERS * SHUFFLE_BUFFER_SIZE * bytes
-# per sample (~32KB with both sequence one-hot and physicochemical
-# decoded) - at the previous 4 workers * 100,000 that was ~13GB, enough to
-# OOM-kill a DataLoader worker on a standard Colab instance. ~1 shard worth
-# of rows at the current NUM_WORKERS=2.
 SHUFFLE_BUFFER_SIZE = 50_000
-
-# How often (wall-clock seconds, not batch count - stays meaningful if
-# BATCH_SIZE changes) to print in-epoch progress during training/validation.
 LOG_INTERVAL_SECONDS = 30.0
-
 DEVICE = "cuda:0"
+
+# ============================================================
+# Active training dataset — single switch, everything below resolves off
+# of it. training/dataset.py and training/train.py import ONLY the
+# ACTIVE_* names, never the HepG2-specific ones above directly, so
+# switching datasets is exactly this one line. The bare (non-ACTIVE_)
+# constants above/below keep meaning "HepG2" unconditionally, for every
+# other script (preprocessing/*, feature_extraction/*) that already
+# hardcodes that assumption — changing DATASET here does not affect them.
+#
+# Set to "HEPG2" or "GM12878".
+# ============================================================
+
+DATASET = "GM12878"
+
+# GM12878 lives in a sibling data root (see preprocessing/download_data_gm12878.py's
+# docstring for why: a separate architecture-validation dataset, hg19, never
+# overlapping HepG2/GRCh38's own data/ tree). Computed directly here (not
+# imported from download_data_gm12878.py) to avoid a circular import — that
+# module itself imports DATA_DIR from here.
+_GM12878_DATA_DIR = DATA_DIR.parent / "data_gm12878"
+
+if DATASET == "HEPG2":
+    ACTIVE_DATA_DIR = DATA_DIR
+    ACTIVE_SEQUENCE_CODES_DIR = SEQUENCE_CODES_DIR
+    ACTIVE_PHYSICOCHEMICAL_DIR = PHYSICOCHEMICAL_FEATURES_DIR
+    ACTIVE_GRAPH_DIR = GRAPH_DIR
+    # HepG2 never had a second (baseline) split, so its per-split
+    # {split}_node_index.npy files sit flat in GRAPH_DIR, not under a
+    # named split subfolder.
+    ACTIVE_SPLIT_NODE_INDEX_DIR = GRAPH_DIR
+    ACTIVE_CHECKPOINT_DIR = CHECKPOINT_DIR
+    ACTIVE_RESULTS_DIR = RESULTS_DIR
+
+    ACTIVE_BATCH_SIZE = BATCH_SIZE
+    ACTIVE_LEARNING_RATE = LEARNING_RATE
+    ACTIVE_WEIGHT_DECAY = WEIGHT_DECAY
+    ACTIVE_L1_LAMBDA = L1_LAMBDA
+    ACTIVE_EPOCHS = EPOCHS
+    ACTIVE_EARLY_STOPPING_PATIENCE = EARLY_STOPPING_PATIENCE
+
+    # No standalone-branch checkpoints exist for HepG2 in this repo, so
+    # warm-start is off: train.py falls back to plain single-phase
+    # from-scratch training (this dataset's original, always-worked path).
+    ACTIVE_WARM_START = False
+    ACTIVE_FROZEN_LEARNING_RATE = LEARNING_RATE
+    ACTIVE_UNFREEZE_LEARNING_RATE = LEARNING_RATE
+    ACTIVE_WARMUP_FROZEN_EPOCHS = 0
+    ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH = None
+    ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH = None
+    ACTIVE_PHYSICOCHEMICAL_ONLY_CHECKPOINT_PATH = None
+
+    ACTIVE_HISTORY_FILENAME = "training_history.json"
+
+elif DATASET == "GM12878":
+    ACTIVE_DATA_DIR = _GM12878_DATA_DIR
+    ACTIVE_SEQUENCE_CODES_DIR = _GM12878_DATA_DIR / "sequence_codes"
+    ACTIVE_PHYSICOCHEMICAL_DIR = _GM12878_DATA_DIR / "physicochemical"
+    ACTIVE_GRAPH_DIR = _GM12878_DATA_DIR / "graph"
+    ACTIVE_SPLIT_NODE_INDEX_DIR = _GM12878_DATA_DIR / "proceed" / "disjoint_split"
+    # Under the Drive-mounted data root (not PROJECT_ROOT-relative like
+    # HepG2's CHECKPOINT_DIR/RESULTS_DIR above) - see
+    # download_data_gm12878.py's docstring: that PROJECT_ROOT-relative
+    # pattern is what lost HepG2 checkpoints across a Colab disconnect once.
+    ACTIVE_CHECKPOINT_DIR = _GM12878_DATA_DIR / "checkpoints" / "full_model_warmstart_disjoint_split"
+    ACTIVE_RESULTS_DIR = _GM12878_DATA_DIR / "results"
+
+    # GM12878-tuned values (found via the sequence-branch hyperparameter
+    # sweep + reused for the full model), not HepG2's config defaults above
+    # - GM12878's train split is far smaller, and the HepG2-scale defaults
+    # were repeatedly found to be a poor fit (see project history).
+    ACTIVE_BATCH_SIZE = 1024
+    ACTIVE_LEARNING_RATE = 1e-05  # only used if ACTIVE_WARM_START is False
+    ACTIVE_WEIGHT_DECAY = 1e-05
+    ACTIVE_L1_LAMBDA = 0.0
+    ACTIVE_EPOCHS = 200
+    ACTIVE_EARLY_STOPPING_PATIENCE = 20
+
+    ACTIVE_WARM_START = True
+    ACTIVE_FROZEN_LEARNING_RATE = 2.5e-05
+    ACTIVE_UNFREEZE_LEARNING_RATE = 1e-05
+    ACTIVE_WARMUP_FROZEN_EPOCHS = 5
+    ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH = _GM12878_DATA_DIR / "checkpoints" / "sequence_only" / "best_model.pt"
+    ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH = _GM12878_DATA_DIR / "checkpoints" / "graph_only" / "best_model.pt"
+    ACTIVE_PHYSICOCHEMICAL_ONLY_CHECKPOINT_PATH = (
+        _GM12878_DATA_DIR / "checkpoints" / "physicochemical_only" / "best_model.pt"
+    )
+
+    ACTIVE_HISTORY_FILENAME = "training_history_full_warmstart_disjoint_split.json"
+
+else:
+    raise ValueError(f"Unknown DATASET={DATASET!r} - expected 'HEPG2' or 'GM12878'.")

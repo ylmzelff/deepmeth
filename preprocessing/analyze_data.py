@@ -16,6 +16,7 @@ Usage (no arguments needed):
 
 from __future__ import annotations
 
+import gzip
 import sys
 from pathlib import Path
 
@@ -54,17 +55,29 @@ BEDMETHYL_COLUMNS = [
 # ============================================================
 
 def load_bedmethyl(path: Path) -> pd.DataFrame:
-    """Load and validate one ENCODE WGBS bedMethyl replicate file."""
+    """Load and validate one ENCODE WGBS/RRBS bedMethyl replicate file."""
     if not path.exists():
         raise FileNotFoundError(
             f"{path} does not exist. Run preprocessing/download_data.py first."
         )
+
+    # Some bedMethyl files (seen on GM12878 RRBS downloads, not on the
+    # HepG2 WGBS ones this was originally written for) have a leading
+    # UCSC "track name=... description=... ..." header line before the
+    # actual tab-separated data. Left unskipped, it gets parsed as a data
+    # row - its fields don't line up with the 11-column layout, corrupting
+    # every column's dtype (pandas then can't parse chrom_start/etc. as
+    # numeric). Detect and skip it instead.
+    with gzip.open(path, "rt") as file:
+        first_line = file.readline()
+    rows_to_skip = 1 if first_line.startswith("track") else 0
 
     dataframe = pd.read_csv(
         path,
         sep="\t",
         header=None,
         compression="gzip",
+        skiprows=rows_to_skip,
     )
 
     if dataframe.shape[1] != len(BEDMETHYL_COLUMNS):
