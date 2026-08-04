@@ -99,8 +99,68 @@ PHYSICOCHEMICAL_SHARD_SIZE = 50_000
 # Hi-C / graph branch
 # ============================================================
 
-GRAPH_RESOLUTION = 100_000  # 100 kb bins, unchanged from the previous project
+# 25kb, not the original 100kb: feature_extraction/analyze_graph_node_label_purity.py's
+# majority-vote-per-node oracle (the real theoretical ceiling for a graph
+# branch that gives every CpG in a node the SAME embedding) was only
+# MCC~0.50 at 100kb, versus MCC~0.69 at 25kb (validation, GM12878) - 100kb
+# bins were mixing ~40 CpGs of often-conflicting labels together. See
+# feature_extraction/preview_graph_resolution_gm12878.py for the cheap
+# (no Hi-C reading, no DNABERT) way this was checked before committing to
+# the real, expensive rebuild at this resolution.
+GRAPH_RESOLUTION = 25_000
 GRAPH_INTRA_CHROMOSOME_ONLY = True  # inter-chromosomal contacts set to 0 (tractability)
+
+# Maximum genomic distance (bp) between two bins for their Hi-C contact to be
+# kept as a graph edge, applied before HIC_TOP_K_NEIGHBORS below. At 100kb
+# resolution with no distance cutoff, a chromosome's contact matrix was
+# nearly fully dense (every bin has *some* nonzero observed count with
+# almost every other bin on the same chromosome, even far away - real
+# signal decays with distance, but hic-straw still returns those low/
+# background-level records) - GM12878's 100kb graph came out to 30,376
+# nodes but 31.6M edges (~1,040 neighbors/node average), which is both
+# (a) mostly background/noise rather than real 3D structure (TADs and
+# loops - the actual biologically meaningful contacts - are almost
+# entirely within a few Mb; Rao et al. 2014) and (b) large enough that a
+# per-edge attention GNN (GATv2Structure) tries to materialize a
+# multi-hundred-GB intermediate tensor and OOMs even on an 80GB+ GPU - see
+# project history. 5 Mb keeps the biologically relevant local neighborhood.
+HIC_MAX_CONTACT_DISTANCE_BP = 5_000_000
+
+# Per-node cap on Hi-C edges, applied after the distance cap above (see
+# feature_extraction/prepare_hic_graph.py's apply_top_k_sparsification).
+# Needed because a fixed *distance* cap doesn't give a fixed *edge count*
+# cap - at 25kb resolution the same 5 Mb window is 4x wider in bin terms
+# than at 100kb, and GM12878 has ~4x more 25kb nodes than 100kb nodes, so
+# distance-capped edge count alone would grow roughly 16x (~43M, re-
+# triggering the same GATv2Conv OOM the distance cap was originally added
+# to fix). Keeping only each node's top-K strongest contacts (by KR-
+# normalized count) bounds edge count by node_count x K regardless of
+# resolution or local Hi-C density, instead of by how dense the region
+# happens to be.
+HIC_TOP_K_NEIGHBORS = 32
+
+# Hi-C matrix balancing applied by hic-straw before we read contact counts -
+# NOT the same thing as the GCN-style symmetric degree normalization applied
+# afterward in prepare_hic_graph.py's normalize_adjacency (that corrects for
+# per-NODE degree in the graph; this corrects for per-BIN sequencing/mappability/
+# GC bias in the raw Hi-C reads themselves - both apply, for different reasons).
+# Raw ("NONE") counts were used originally, which conflates true 3D contact
+# frequency with distance-decay and coverage artifacts.
+#
+# SCALE, not KR: Knight & Ruiz (2013) / Rao et al. 2014 introduced KR
+# balancing as the original Hi-C convention, but Aiden Lab's own Juicer
+# tooling has since moved to SCALE as its default for genome-wide/
+# inter-chromosomal normalization (GW_SCALE/INTER_SCALE superseding
+# GW_KR/INTER_KR) - same family of matrix-balancing method, but converges
+# more reliably than KR on sparse/large matrices. hic-straw exposes both;
+# if a given .hic file only has KR vectors precomputed (older files
+# sometimes lack SCALE), fall back to "KR" here.
+#
+# GM12878's .hic file (ENCFF355OWW, an older ENCODE Hi-C release) only has
+# KR vectors precomputed at 100kb - hic-straw raised "File did not contain
+# SCALE normalization vectors for one or both chromosomes at 100000 BP"
+# when this was set to "SCALE" - using the documented fallback.
+HIC_NORMALIZATION_TYPE = "KR"
 NODE_FEATURE_DIM = 768  # DNABERT-2 hidden size
 
 # ============================================================

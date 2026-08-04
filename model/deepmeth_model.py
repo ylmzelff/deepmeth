@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 from model.sequence_branch import DanQ_Sequence
-from model.sequence_branch_transformer import TransformerSequence
 from model.graph_branch import GCN_Structure
 from model.physicochemical_branch import CNNNet_PhyChemDi
 from model.fusion import GatedFusion
@@ -45,28 +44,16 @@ class DeepMethModel(nn.Module):
         fusion_dropout_prob: float,
         use_sequence_self_attention: bool = False,
         use_physchem_property_gate: bool = False,
-        use_transformer_sequence_branch: bool = False,
     ):
         super(DeepMethModel, self).__init__()
 
-        # use_transformer_sequence_branch swaps the entire ncVarPred DanQ
-        # sequence branch for model/sequence_branch_transformer.py's
-        # TransformerSequence (multi-scale conv stem + ALiBi relative-
-        # position Transformer encoder) - a deeper architecture change than
-        # use_sequence_self_attention below, which only swaps DanQ's BiLSTM
-        # for a single small self-attention layer. Both output [B, 925],
-        # so this is a drop-in swap; use_sequence_self_attention is ignored
-        # when this is True.
-        if use_transformer_sequence_branch:
-            self.sequence_branch = TransformerSequence()
-        else:
-            # ncVarPred DanQ-based sequence branch. use_sequence_self_attention
-            # swaps the BiLSTM for a lightweight Transformer encoder over the
-            # same 36 CNN positions - see model/sequence_branch.py. Default
-            # False reproduces the original DanQ path unchanged.
-            self.sequence_branch = DanQ_Sequence(
-                use_self_attention=use_sequence_self_attention
-            )
+        # ncVarPred DanQ-based sequence branch. use_sequence_self_attention
+        # swaps the BiLSTM for a lightweight Transformer encoder over the
+        # same 36 CNN positions - see model/sequence_branch.py. Default
+        # False reproduces the original DanQ path unchanged.
+        self.sequence_branch = DanQ_Sequence(
+            use_self_attention=use_sequence_self_attention
+        )
 
         # ncVarPred GCN-based structure branch.
         self.structure_branch = GCN_Structure()
