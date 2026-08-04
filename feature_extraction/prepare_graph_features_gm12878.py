@@ -31,15 +31,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 
 from config.project_config import DNABERT_HIDDEN_SIZE, GRAPH_RESOLUTION, INCLUDED_CHROMOSOMES
 from preprocessing.download_data_gm12878 import GM12878_DATA_DIR
 
 GM12878_GRAPH_DIR = GM12878_DATA_DIR / "graph"
 NODE_INDEX_PATH = GM12878_GRAPH_DIR / "node_index.parquet"
-ADJACENCY_PATH = GM12878_GRAPH_DIR / "adjacency_normalized.npz"
 NODE_FEATURES_OUTPUT_PATH = GM12878_GRAPH_DIR / "node_features.npy"
+
+# Must match model/graph_branch_gat.py's own EXTRA_NODE_FEATURE_DIM
+# (independently derived from the same INCLUDED_CHROMOSOMES constant, not
+# imported directly, to avoid a model/ -> feature_extraction/ dependency).
+CHROMOSOME_TO_INDEX = {chrom: index for index, chrom in enumerate(INCLUDED_CHROMOSOMES)}
+EXTRA_NODE_FEATURE_DIM = len(INCLUDED_CHROMOSOMES) + 2
 
 GM12878_DNABERT_NODE_FEATURES_DIR = GM12878_DATA_DIR / "dnabert2_node_features"
 
@@ -132,6 +136,63 @@ def build_node_features(
     return node_features
 
 
+def build_extra_node_features(node_index: pd.DataFrame, dnabert_index: pd.DataFrame) -> np.ndarray:
+    """
+    3 kinds of cheap, leak-free feature appended after the raw 768-d
+    DNABERT-2 node embedding - none use methylation labels or any real
+    epigenomic measurement, only genomic coordinates and the DNABERT
+    extraction's own bookkeeping:
+
+      - chromosome one-hot (len(INCLUDED_CHROMOSOMES) dims): GATv2Structure
+        previously had no notion of which chromosome a node is on at all.
+      - normalized position within chromosome (1 dim: bin_start / that
+        chromosome's own max bin_end): previously no way to distinguish a
+        telomere-proximal node from a centromere-proximal one.
+      - normalized sample_count (1 dim): how many CG windows were actually
+        averaged into this node's 768-d embedding (capped at
+        GM12878_MAX_CPG_PER_NODE=128 in extract_dnabert2_gm12878.py) -
+        this was already computed there but silently discarded when
+        node_features.npy was first built (see project history). Lets the
+        model distinguish a well-supported embedding (many CGs averaged,
+        e.g. a CG-dense promoter/CpG-island region) from a noisy one (few
+        CGs, e.g. mostly repeat/gap sequence) instead of treating both
+        identically. Normalized by this dataset's own observed max
+        (not hardcoding 128), so it stays correct if that cap ever changes.
+    """
+    number_of_nodes = len(node_index)
+
+    chromosome_indices = node_index["chrom"].map(CHROMOSOME_TO_INDEX).to_numpy()
+    if pd.isna(chromosome_indices).any():
+        raise RuntimeError("node_index.parquet contains a chromosome not in INCLUDED_CHROMOSOMES.")
+    chromosome_one_hot = np.zeros((number_of_nodes, len(INCLUDED_CHROMOSOMES)), dtype=np.float32)
+    chromosome_one_hot[np.arange(number_of_nodes), chromosome_indices.astype(np.int64)] = 1.0
+
+    chrom_max_bin_end = node_index.groupby("chrom")["bin_end"].transform("max").to_numpy()
+    normalized_position = (node_index["bin_start"].to_numpy() / chrom_max_bin_end).astype(np.float32)
+
+    merged = node_index.merge(
+        dnabert_index[["chrom", "bin_start", "sample_count"]], on=["chrom", "bin_start"], how="left",
+    )
+    if len(merged) != number_of_nodes:
+        raise RuntimeError(
+            f"Merge produced {len(merged):,} rows, expected {number_of_nodes:,} - duplicate (chrom, bin_start) somewhere."
+        )
+    sample_count = merged["sample_count"].fillna(0).to_numpy(dtype=np.float32)
+    max_sample_count = float(dnabert_index["sample_count"].max())
+    normalized_sample_count = sample_count / max_sample_count if max_sample_count > 0 else sample_count
+
+    extra_features = np.concatenate(
+        [chromosome_one_hot, normalized_position[:, None], normalized_sample_count[:, None]], axis=1,
+    ).astype(np.float32)
+
+    if extra_features.shape != (number_of_nodes, EXTRA_NODE_FEATURE_DIM):
+        raise RuntimeError(f"Unexpected extra feature shape: {extra_features.shape}")
+    if not np.isfinite(extra_features).all():
+        raise RuntimeError("Non-finite values in computed extra node features.")
+
+    return extra_features
+
+
 def compute_node_index_for_split(split_name: str, node_index: pd.DataFrame) -> None:
     dataset_path = DISJOINT_SPLIT_DIR / f"{split_name}.parquet"
 
@@ -170,18 +231,11 @@ def main() -> None:
     number_of_nodes = len(node_index)
     print(f"Total graph nodes: {number_of_nodes:,}")
 
-    if ADJACENCY_PATH.exists():
-        adjacency_shape = sp.load_npz(ADJACENCY_PATH).shape
-        if adjacency_shape[0] != number_of_nodes:
-            raise RuntimeError(
-                f"node_index.parquet has {number_of_nodes:,} nodes but "
-                f"adjacency_normalized.npz has shape {adjacency_shape} - out of sync, "
-                "rerun feature_extraction/prepare_hic_graph_gm12878.py."
-            )
-
-    print("\n[1/2] Building node_features.npy from DNABERT-2 node embeddings")
+    print("\n[1/2] Building node_features.npy from DNABERT-2 embeddings + chromosome/position/sample_count features")
     dnabert_index, dnabert_embeddings = load_dnabert_node_features()
-    node_features = build_node_features(node_index, dnabert_index, dnabert_embeddings)
+    dnabert_node_features = build_node_features(node_index, dnabert_index, dnabert_embeddings)
+    extra_node_features = build_extra_node_features(node_index, dnabert_index)
+    node_features = np.concatenate([dnabert_node_features, extra_node_features], axis=1)
 
     if not np.isfinite(node_features).all():
         raise RuntimeError("node_features contains NaN or infinite values.")

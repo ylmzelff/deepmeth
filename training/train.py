@@ -18,11 +18,20 @@ Two training modes, selected by ACTIVE_WARM_START:
     Empirically this beat from-scratch training on GM12878 (val_mcc
     0.66 vs 0.60) - see project history.
 
-The graph branch runs a GCN over the *entire* static Hi-C graph on every
-batch (this is the original ncVarPred design: full-graph message passing,
-then a row-select pulls the batch's nodes out of the result) - so
-node_features.npy and adjacency_normalized.npz are loaded once and kept
-resident on the device for the whole run, not re-loaded per batch.
+The graph branch runs GATv2Structure (see model/graph_branch_gat.py) over
+the *entire* static Hi-C graph on every batch (full-graph message passing,
+then a row-select pulls the batch's nodes out of the result, followed by
+CpGAwareGraphReadout conditioning that on each sample's own sequence
+embedding - see model/graph_readout.py) - so node_features.npy and
+edge_features.npz are loaded once and kept resident on the device for the
+whole run, not re-loaded per batch.
+
+HepG2 note: this GATv2-based graph branch needs edge_features.npz (O/E Hi-C
+edge features), which only feature_extraction/prepare_hic_graph_gm12878.py
+currently computes - HepG2's own prepare_hic_graph.py never gained that
+step, so this script's HepG2 path is broken until/unless that's added.
+GM12878 is this project's active focus (see project history); fixing HepG2
+was deliberately deferred rather than done here.
 
 Resumable: if last_checkpoint.pt exists (under ACTIVE_CHECKPOINT_DIR),
 training resumes from there (model/optimizer/scheduler state, epoch, best
@@ -45,7 +54,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-import scipy.sparse as sp
 import torch
 import torch.nn as nn
 from sklearn.metrics import (
@@ -92,10 +100,11 @@ from config.project_config import (
     USE_SEQUENCE_SELF_ATTENTION,
 )
 from model.deepmeth_model import DeepMethModel
+from model.graph_branch_gat import load_oe_edge_index
 from training.dataset import DeepMethShardDataset, collate_batch
 
 NODE_FEATURES_PATH = ACTIVE_GRAPH_DIR / "node_features.npy"
-ADJACENCY_PATH = ACTIVE_GRAPH_DIR / "adjacency_normalized.npz"
+EDGE_FEATURES_PATH = ACTIVE_GRAPH_DIR / "edge_features.npz"
 LAST_CHECKPOINT_PATH = ACTIVE_CHECKPOINT_DIR / "last_checkpoint.pt"
 BEST_CHECKPOINT_PATH = ACTIVE_CHECKPOINT_DIR / "best_model.pt"
 HISTORY_PATH = ACTIVE_RESULTS_DIR / ACTIVE_HISTORY_FILENAME
@@ -106,40 +115,26 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def load_graph_tensors(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, int]:
+def load_graph_tensors(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     if not NODE_FEATURES_PATH.exists():
         raise FileNotFoundError(
             f"{NODE_FEATURES_PATH} does not exist. Run the matching prepare_graph_features script first."
         )
-    if not ADJACENCY_PATH.exists():
+    if not EDGE_FEATURES_PATH.exists():
         raise FileNotFoundError(
-            f"{ADJACENCY_PATH} does not exist. Run the matching prepare_hic_graph script first."
+            f"{EDGE_FEATURES_PATH} does not exist. Run the matching prepare_hic_graph script first "
+            "(see this module's HepG2 docstring note if DATASET is HEPG2)."
         )
 
     node_features = np.load(NODE_FEATURES_PATH)
-    adjacency = sp.load_npz(ADJACENCY_PATH).tocsr()
-
-    if node_features.shape[0] != adjacency.shape[0]:
-        raise RuntimeError(
-            f"node_features.npy has {node_features.shape[0]:,} nodes but adjacency_normalized.npz has "
-            f"shape {adjacency.shape} - out of sync, rerun the feature_extraction graph scripts."
-        )
+    edge_index, edge_attr = load_oe_edge_index(EDGE_FEATURES_PATH)
 
     number_of_nodes = node_features.shape[0]
     node_features_tensor = torch.from_numpy(node_features).float().to(device)
+    edge_index = edge_index.to(device)
+    edge_attr = edge_attr.to(device)
 
-    # CSR instead of COO for the sparse adjacency: torch.spmm (used inside
-    # GraphConvolution) on a CSR tensor uses a much better-optimized CUDA
-    # kernel than COO for repeated matmuls against a fixed sparse structure -
-    # same math (bit-for-bit equivalent), just a faster storage format.
-    adjacency_tensor = torch.sparse_csr_tensor(
-        torch.tensor(adjacency.indptr, dtype=torch.int64),
-        torch.tensor(adjacency.indices, dtype=torch.int64),
-        torch.tensor(adjacency.data, dtype=torch.float32),
-        size=adjacency.shape,
-    ).to(device)
-
-    return node_features_tensor, adjacency_tensor, number_of_nodes
+    return node_features_tensor, edge_index, edge_attr, number_of_nodes
 
 
 def resolve_pos_weight(train_dataset: DeepMethShardDataset) -> float:
@@ -194,6 +189,21 @@ def load_branch_weights(submodule: nn.Module, checkpoint_path: Path, prefix: str
     print(f"  Loaded {len(branch_state_dict)} tensors from {checkpoint_path.name} -> {prefix.rstrip('.')}")
 
 
+def load_structure_branch_weights(module: nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+    """training/train_graph_gat.py saves GATv2Structure's weights directly
+    (torch.save(model.structure_branch.state_dict(), ...) - no wrapping
+    "model_state_dict" dict, no "structure_branch." key prefix, unlike the
+    sequence/physchem standalone checkpoints load_branch_weights above
+    handles), so it needs its own, simpler loader instead of that one."""
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"{checkpoint_path} does not exist. Run training/train_graph_gat.py first."
+        )
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    module.load_state_dict(state_dict, strict=True)
+    print(f"  Loaded GATv2 structure branch weights from {checkpoint_path.name}")
+
+
 def set_branch_trainable(model: DeepMethModel, trainable: bool) -> None:
     for module in (model.sequence_branch, model.structure_branch, model.physchem_branch):
         for parameter in module.parameters():
@@ -221,7 +231,8 @@ def run_epoch(
     model: nn.Module,
     loader: DataLoader,
     node_features: torch.Tensor,
-    adjacency: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
     criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
@@ -250,7 +261,8 @@ def run_epoch(
             logits = model(
                 seq_input=sequence_input,
                 node_input=node_features,
-                adj_input=adjacency,
+                edge_index=edge_index,
+                edge_attr=edge_attr,
                 node_index=node_index,
                 physchem_input=physchem_input,
             ).squeeze(1)
@@ -265,8 +277,10 @@ def run_epoch(
 
                 if ACTIVE_L1_LAMBDA > 0:
                     # ncVarPred's own training code applies L1 specifically
-                    # to the fusion (FC) and GCN layers, not the conv/
-                    # BiLSTM/physicochemical branches - matched here.
+                    # to the fusion (FC) and graph structure layers, not the
+                    # conv/BiLSTM/physicochemical branches - matched here
+                    # (structure_branch is GATv2Structure now, not the
+                    # original GCN, but the same scope applies).
                     l1_penalty = sum(
                         parameter.abs().sum()
                         for module in (model.fusion, model.structure_branch)
@@ -276,7 +290,7 @@ def run_epoch(
 
                 optimizer.zero_grad()
                 training_loss.backward()
-                # Caps the rare large-gradient batch (BiLSTM/GCN stacks can
+                # Caps the rare large-gradient batch (BiLSTM/GATv2 stacks can
                 # produce one) from knocking the model out of a good region
                 # in a single step; a no-op on normal small-gradient steps.
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
@@ -336,9 +350,9 @@ def main() -> None:
           f"weight_decay={ACTIVE_WEIGHT_DECAY:.0e}, l1_lambda={ACTIVE_L1_LAMBDA}, "
           f"epochs={ACTIVE_EPOCHS}, early_stopping_patience={ACTIVE_EARLY_STOPPING_PATIENCE}")
 
-    print("\n[1/5] Loading graph tensors (node features + adjacency)")
-    node_features, adjacency, number_of_nodes = load_graph_tensors(device)
-    print(f"Graph nodes: {number_of_nodes:,}")
+    print("\n[1/5] Loading graph tensors (node features + Hi-C edge_index/edge_attr)")
+    node_features, edge_index, edge_attr, number_of_nodes = load_graph_tensors(device)
+    print(f"Graph nodes: {number_of_nodes:,} | Edges (incl. self-loops): {edge_index.shape[1]:,}")
 
     print("\n[2/5] Building datasets")
     train_dataset, train_loader = build_loader("train", shuffle=True)
@@ -359,7 +373,7 @@ def main() -> None:
     if ACTIVE_WARM_START:
         print("\n[4/5] Warm-starting branches from standalone checkpoints")
         load_branch_weights(model.sequence_branch, ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH, "sequence_branch.", device)
-        load_branch_weights(model.structure_branch, ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH, "structure_branch.", device)
+        load_structure_branch_weights(model.structure_branch, ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH, device)
         load_branch_weights(model.physchem_branch, ACTIVE_PHYSICOCHEMICAL_ONLY_CHECKPOINT_PATH, "physchem_branch.", device)
     else:
         print("\n[4/5] No warm-start for this dataset - training from scratch")
@@ -413,13 +427,13 @@ def main() -> None:
 
         train_dataset.set_epoch(epoch)
         train_metrics = run_epoch(
-            model, train_loader, node_features, adjacency, criterion, device, optimizer,
+            model, train_loader, node_features, edge_index, edge_attr, criterion, device, optimizer,
             phase_name="train",
         )
 
         validation_dataset.set_epoch(epoch)
         validation_metrics = run_epoch(
-            model, validation_loader, node_features, adjacency, criterion, device, None,
+            model, validation_loader, node_features, edge_index, edge_attr, criterion, device, None,
             phase_name="validation",
         )
 

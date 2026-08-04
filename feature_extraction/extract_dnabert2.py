@@ -82,6 +82,18 @@ def load_frozen_model(device: torch.device):
         config=config,
         trust_remote_code=True,
         low_cpu_mem_usage=False,
+        # Newer transformers versions decoupled "fast init" (constructs
+        # parameters on a torch.device("meta") placeholder, then materializes
+        # them from the checkpoint) from low_cpu_mem_usage - it now defaults
+        # to True regardless. DNABERT-2's own bert_layers.py isn't meta-
+        # device-aware: BertEncoder.__init__ eagerly computes a real ALiBi
+        # bias tensor on CPU during construction, before the meta-initialized
+        # parameters are materialized, so the two end up on different
+        # devices ("Tensor on device meta is not on the expected device
+        # cpu!"). _fast_init=False forces plain eager (CPU) construction,
+        # side-stepping the mismatch - this repo's own model/*.py modules
+        # aren't affected (they're not loaded via from_pretrained).
+        _fast_init=False,
     )
 
     model = model.to(device)

@@ -4,11 +4,11 @@ architecture-validation counterpart to feature_extraction/prepare_hic_graph.py
 (HepG2/GRCh38). Same graph construction (node index + normalized adjacency),
 different genome build and raw .hic file.
 
-Reuses build_raw_adjacency/normalize_adjacency/normalize_chromosome_name from
-prepare_hic_graph.py unchanged (genome-agnostic: they take the .hic file
-handle and node index as arguments, no hardcoded HepG2/GRCh38 path inside).
-Only build_node_index is redefined locally, since the original hardcodes
-HIC_RAW_FILE_PATH (HepG2's GRCh38 .hic) - here it points at
+Reuses build_raw_adjacency/compute_oe_edge_features/normalize_chromosome_name
+from prepare_hic_graph.py unchanged (genome-agnostic: they take the .hic
+file handle and node index as arguments, no hardcoded HepG2/GRCh38 path
+inside). Only build_node_index is redefined locally, since the original
+hardcodes HIC_RAW_FILE_PATH (HepG2's GRCh38 .hic) - here it points at
 GM12878_HIC_RAW_FILE_PATH (hg19) instead.
 
 Requires `pip install hic-straw` and download_data_gm12878.py to have run.
@@ -28,18 +28,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hicstraw
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 
 from config.project_config import GRAPH_RESOLUTION, INCLUDED_CHROMOSOMES
-from feature_extraction.prepare_hic_graph import build_raw_adjacency, compute_oe_edge_features, normalize_adjacency
+from feature_extraction.prepare_hic_graph import build_raw_adjacency, compute_oe_edge_features
 from preprocessing.download_data_gm12878 import GM12878_DATA_DIR, GM12878_HIC_RAW_FILE_PATH
 
 GM12878_GRAPH_DIR = GM12878_DATA_DIR / "graph"
 NODE_INDEX_PATH = GM12878_GRAPH_DIR / "node_index.parquet"
-ADJACENCY_PATH = GM12878_GRAPH_DIR / "adjacency_normalized.npz"
-# 4-feature GATv2 edge representation (log1p(KR count), O/E, log1p(distance),
-# is_self_loop) - separate from ADJACENCY_PATH above, which stays in its
-# original single-value, degree-normalized format for GCN_Structure/train.py.
+# 4-feature GATv2 edge representation: log1p(KR count), O/E, log1p(distance),
+# is_self_loop - see compute_oe_edge_features.
 EDGE_FEATURES_PATH = GM12878_GRAPH_DIR / "edge_features.npz"
 
 
@@ -120,34 +117,24 @@ def main() -> None:
 
     GM12878_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("\n[1/4] Building node index")
+    print("\n[1/3] Building node index")
     node_index, hic_file, raw_names = build_node_index()
     print(f"Total nodes: {len(node_index):,}")
 
     node_index.to_parquet(NODE_INDEX_PATH, index=False)
     print(f"Saved: {NODE_INDEX_PATH}")
 
-    print("\n[2/4] Reading intra-chromosomal Hi-C contacts")
+    print("\n[2/3] Reading intra-chromosomal Hi-C contacts")
     raw_adjacency = build_raw_adjacency(node_index, hic_file, raw_names)
     print(f"Raw adjacency non-zero entries: {raw_adjacency.nnz:,}")
 
-    print("\n[3/4] Normalizing adjacency (self-loops + symmetric degree norm) - for GCN_Structure")
-    normalized_adjacency = normalize_adjacency(raw_adjacency)
-
-    if not np.isfinite(normalized_adjacency.data).all():
-        raise RuntimeError("Normalized adjacency contains NaN or infinite values.")
-
-    sp.save_npz(ADJACENCY_PATH, normalized_adjacency)
-    print(f"Saved: {ADJACENCY_PATH}")
-
-    print("\n[4/4] Computing O/E edge features (log1p(count), O/E, log1p(distance), is_self_loop) - for GATv2Structure")
+    print("\n[3/3] Computing O/E edge features (log1p(count), O/E, log1p(distance), is_self_loop) - for GATv2Structure")
     edge_rows, edge_cols, edge_features = compute_oe_edge_features(raw_adjacency, GRAPH_RESOLUTION)
     np.savez_compressed(EDGE_FEATURES_PATH, rows=edge_rows, cols=edge_cols, features=edge_features)
     print(f"Saved: {EDGE_FEATURES_PATH}  ({len(edge_rows):,} edges incl. self-loops, {edge_features.shape[1]} features/edge)")
 
     print("\nGM12878 Hi-C graph construction completed.")
     print(f"Nodes: {len(node_index):,}")
-    print(f"Adjacency non-zero entries (post-normalization): {normalized_adjacency.nnz:,}")
 
 
 if __name__ == "__main__":

@@ -81,12 +81,62 @@ EDGE_FEATURES_PATH = ACTIVE_GRAPH_DIR / "edge_features.npz"
 # shape mismatch anyway, but using a separate directory also means the
 # earlier single-edge-value run's checkpoint (val_mcc ~0.57-0.58) is kept
 # on disk untouched, for a direct before/after comparison.
-CHECKPOINT_SUBDIR = ACTIVE_CHECKPOINT_DIR.parent / "graph_gat_oe_only"
+#
+# Bumped again from graph_gat_oe_only to graph_gat_oe_ln_nodefeat: adding
+# LayerNorm + the chromosome/position/sample_count node features changed
+# GATv2Structure.input_projection's shape (768 -> NODE_FEATURE_DIM=793, see
+# model/graph_branch_gat.py) and added norm1/norm2 - graph_gat_oe_only's
+# checkpoint is incompatible for the same reason as above, so it's kept
+# on disk untouched too, for a three-way before/after/after comparison.
+# (Result: best_val_loss=0.6394, best_val_mcc=0.5786 - see project history.)
+#
+# Bumped a third time to graph_gat_oe_ln_nodefeat_ssl once
+# training/pretrain_graph_selfsupervised.py existed as an optional warm
+# start (see SELF_SUPERVISED_CHECKPOINT_PATH below) - same weight shapes as
+# graph_gat_oe_ln_nodefeat, so this checkpoint WOULD load into either
+# script's model, but a separate directory keeps the with-SSL-warm-start and
+# without-it results directly comparable instead of one overwriting the
+# other. (Result: warm-started run tracked ~0.01 MCC below the non-SSL run
+# at the same epoch, within noise - see project history.)
+#
+# Bumped a fourth time to graph_gat_10kb: GRAPH_RESOLUTION moved 25kb -> 10kb
+# (see config.project_config - the majority-vote-per-node oracle rises from
+# ~0.69 to ~0.77 at 10kb, and every 25kb GATv2 variant tried had converged
+# to the same ~0.55-0.58 MCC band regardless of edge/node-feature/SSL
+# changes, consistent with all of them hitting the 25kb oracle's ceiling
+# rather than an architectural limit). NODE_FEATURE_DIM is unchanged (793 -
+# EXTRA_NODE_FEATURE_DIM doesn't depend on node count), so the OLD 25kb
+# checkpoints in graph_gat_oe_ln_nodefeat[_ssl] would technically still
+# LOAD here without a shape error - but their weights were learned on a
+# completely different graph (121K 25kb nodes vs 303K 10kb nodes, different
+# edges), so reusing them would be a meaningless warm start, not a real
+# resume - a new directory avoids that trap.
+CHECKPOINT_SUBDIR = ACTIVE_CHECKPOINT_DIR.parent / "graph_gat_10kb"
 LAST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "last_checkpoint.pt"
 BEST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model.pt"
 STRUCTURE_BRANCH_WEIGHTS_PATH = CHECKPOINT_SUBDIR / "structure_branch_pretrained.pt"
+# Second, purely additive checkpoint pair selected by val_mcc instead of
+# val_loss - see the best_validation_mcc tracking in main(). Fusion scripts
+# keep warm-starting from STRUCTURE_BRANCH_WEIGHTS_PATH above (unchanged);
+# this one exists for whoever wants the actual best-MCC epoch's weights.
+BEST_MCC_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model_mcc.pt"
+STRUCTURE_BRANCH_WEIGHTS_MCC_PATH = CHECKPOINT_SUBDIR / "structure_branch_pretrained_mcc.pt"
 
-HISTORY_PATH = ACTIVE_RESULTS_DIR / "training_history_graph_gat_oe_only.json"
+# Optional warm start, produced by training/pretrain_graph_selfsupervised.py
+# (link prediction on real Hi-C contacts - no methylation labels involved).
+# Only applied on a genuinely fresh run (see main() - LAST_CHECKPOINT_PATH
+# resume always takes priority when both exist, since that checkpoint's
+# weights already reflect this warm start plus however much further
+# methylation-supervised training happened after it). Points at the 10kb
+# self-supervised checkpoint dir (see pretrain_graph_selfsupervised.py's own
+# CHECKPOINT_SUBDIR, bumped the same way and for the same reason as this
+# file's above) - doesn't exist until that script is rerun on the 10kb
+# graph, so this run starts from a random init unless/until it is.
+SELF_SUPERVISED_CHECKPOINT_PATH = (
+    ACTIVE_CHECKPOINT_DIR.parent / "graph_gat_selfsupervised_10kb" / "structure_branch_selfsupervised.pt"
+)
+
+HISTORY_PATH = ACTIVE_RESULTS_DIR / "training_history_graph_gat_10kb.json"
 
 
 class NodeLabelDataset(Dataset):
@@ -179,6 +229,44 @@ class GraphOnlyModel(nn.Module):
     ) -> torch.Tensor:
         embedding = self.structure_branch(node_features, edge_index, edge_attr, node_index)
         return self.head(embedding).squeeze(1)
+
+
+def collect_validation_probabilities(
+    model: nn.Module,
+    loader: DataLoader,
+    node_features: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    all_probabilities = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in loader:
+            node_index = batch["node_index"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            logits = model(node_features, edge_index, edge_attr, node_index)
+            all_probabilities.append(torch.sigmoid(logits).cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+    return np.concatenate(all_probabilities), np.concatenate(all_labels)
+
+
+def sweep_best_threshold(probabilities: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+    """Scans candidate decision thresholds on already-computed validation
+    probabilities for the one maximizing MCC - the fixed 0.5 default used
+    everywhere else in this project isn't necessarily optimal under the
+    dataset's ~21% positive class rate. A pure lookup over one held-out
+    split (no refitting), so this doesn't introduce new leakage - the same
+    validation split already used for model/checkpoint selection."""
+    best_threshold = 0.5
+    best_mcc = matthews_corrcoef(labels, (probabilities >= 0.5).astype(np.int8))
+    for threshold in np.arange(0.05, 0.951, 0.01):
+        mcc = matthews_corrcoef(labels, (probabilities >= threshold).astype(np.int8))
+        if mcc > best_mcc:
+            best_mcc = float(mcc)
+            best_threshold = float(threshold)
+    return best_threshold, best_mcc
 
 
 def run_epoch(
@@ -294,6 +382,15 @@ def main() -> None:
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {num_params:,}")
 
+    # Self-supervised warm start (training/pretrain_graph_selfsupervised.py's
+    # link-prediction pretraining) - only on a genuinely fresh run, since a
+    # LAST_CHECKPOINT_PATH resume below already contains this warm start
+    # plus whatever methylation-supervised training happened after it.
+    if SELF_SUPERVISED_CHECKPOINT_PATH.exists() and not LAST_CHECKPOINT_PATH.exists():
+        structure_state_dict = torch.load(SELF_SUPERVISED_CHECKPOINT_PATH, map_location=device, weights_only=False)
+        model.structure_branch.load_state_dict(structure_state_dict)
+        print(f"Warm-started structure_branch from {SELF_SUPERVISED_CHECKPOINT_PATH}")
+
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler(device="cuda")
@@ -306,6 +403,14 @@ def main() -> None:
 
     start_epoch = 0
     best_validation_loss = float("inf")
+    # Tracked alongside best_validation_loss, not instead of it: the two
+    # don't always pick the same epoch (a prior run's val_loss-best epoch
+    # wasn't its val_mcc-best epoch), so both checkpoints are kept - the
+    # val_loss one stays what fusion scripts warm-start structure_branch
+    # from (unchanged path/behavior), the val_mcc one is a second, purely
+    # additive save for whoever wants the epoch that was actually best by
+    # the metric this branch is judged on.
+    best_validation_mcc = -float("inf")
     patience_counter = 0
     history = []
 
@@ -322,6 +427,16 @@ def main() -> None:
         best_validation_loss = checkpoint["best_validation_loss"]
         patience_counter = checkpoint["patience_counter"]
         history = checkpoint["history"]
+
+        if "best_validation_mcc" in checkpoint:
+            best_validation_mcc = checkpoint["best_validation_mcc"]
+        elif history:
+            # Backward-compat: resuming from a last_checkpoint.pt saved
+            # before this dual-checkpoint change existed - reconstruct the
+            # running best-MCC from the stored per-epoch history instead of
+            # restarting it from -inf.
+            best_validation_mcc = max(entry["validation"]["mcc"] for entry in history)
+            print(f"  (older checkpoint format: reconstructed best_validation_mcc={best_validation_mcc:.4f} from history)")
 
     print("\n[4/4] Training")
     for epoch in range(start_epoch, EPOCHS):
@@ -341,13 +456,19 @@ def main() -> None:
         scheduler.step(validation_metrics["loss"])
         current_lr = optimizer.param_groups[0]["lr"]
 
+        # Early stopping/patience still keyed on val_loss only, unchanged -
+        # the parallel val_mcc-best tracking below is purely additive and
+        # never affects when training stops.
         improved = validation_metrics["loss"] < best_validation_loss - EARLY_STOPPING_MIN_DELTA
+        mcc_improved = validation_metrics["mcc"] > best_validation_mcc + EARLY_STOPPING_MIN_DELTA
         print(
             f"Epoch {epoch + 1}/{EPOCHS} ({epoch_duration:.1f}s) | "
             f"train_loss={train_metrics['loss']:.4f} | val_loss={validation_metrics['loss']:.4f} | "
             f"val_balanced_acc={validation_metrics['balanced_accuracy']:.4f} | "
             f"val_mcc={validation_metrics['mcc']:.4f} | val_auc={validation_metrics['roc_auc']:.4f} | "
-            f"lr={current_lr:.2e}" + ("  <- best" if improved else "")
+            f"lr={current_lr:.2e}"
+            + ("  <- best loss" if improved else "")
+            + ("  <- best mcc" if mcc_improved else "")
         )
 
         history.append({"epoch": epoch, "train": train_metrics, "validation": validation_metrics, "epoch_seconds": epoch_duration})
@@ -364,6 +485,15 @@ def main() -> None:
         else:
             patience_counter += 1
 
+        if mcc_improved:
+            best_validation_mcc = validation_metrics["mcc"]
+            torch.save(
+                {"epoch": epoch, "model_state_dict": model.state_dict(), "validation_metrics": validation_metrics},
+                BEST_MCC_CHECKPOINT_PATH,
+            )
+            torch.save(model.structure_branch.state_dict(), STRUCTURE_BRANCH_WEIGHTS_MCC_PATH)
+            print(f"  New best validation MCC: {best_validation_mcc:.4f} -> saved {STRUCTURE_BRANCH_WEIGHTS_MCC_PATH}")
+
         torch.save(
             {
                 "epoch": epoch,
@@ -372,6 +502,7 @@ def main() -> None:
                 "scaler_state_dict": scaler.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_validation_loss": best_validation_loss,
+                "best_validation_mcc": best_validation_mcc,
                 "patience_counter": patience_counter,
                 "history": history,
             },
@@ -387,7 +518,21 @@ def main() -> None:
 
     print("\nGATv2Structure pretraining completed.")
     print(f"Best validation loss: {best_validation_loss:.4f}")
-    print(f"Structure branch weights: {STRUCTURE_BRANCH_WEIGHTS_PATH}")
+    print(f"Best validation MCC (0.5 threshold): {best_validation_mcc:.4f}")
+    print(f"Structure branch weights (val_loss-best): {STRUCTURE_BRANCH_WEIGHTS_PATH}")
+    print(f"Structure branch weights (val_mcc-best):  {STRUCTURE_BRANCH_WEIGHTS_MCC_PATH}")
+
+    print("\nSweeping validation decision threshold on the best-MCC checkpoint...")
+    best_mcc_checkpoint = torch.load(BEST_MCC_CHECKPOINT_PATH, map_location=device, weights_only=False)
+    model.load_state_dict(best_mcc_checkpoint["model_state_dict"])
+    probabilities, labels_array = collect_validation_probabilities(
+        model, validation_loader, node_features, edge_index, edge_attr, device,
+    )
+    best_threshold, best_threshold_mcc = sweep_best_threshold(probabilities, labels_array)
+    print(
+        f"Best threshold: {best_threshold:.2f} -> val_mcc={best_threshold_mcc:.4f} "
+        f"(vs {best_validation_mcc:.4f} at the default 0.5 threshold)"
+    )
     print("Compare this run's best val_mcc against GCN_Structure's own standalone "
           "ceiling (~0.26 on GM12878) before deciding whether to swap it into the full model.")
 

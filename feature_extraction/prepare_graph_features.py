@@ -1,6 +1,6 @@
 """
 Combine the Hi-C node index with the DNABERT-2 node features into the final
-node_features.npy (one row per graph node, matching adjacency_normalized.npz's
+node_features.npy (one row per graph node, matching node_index.parquet's
 node ordering), and map every CpG in train/validation/test to its graph node
 (needed at training time to select which node's row applies to each sample).
 
@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 
 from config.project_config import (
     DATASET_DIR,
@@ -32,7 +31,6 @@ from config.project_config import (
 )
 
 NODE_INDEX_PATH = GRAPH_DIR / "node_index.parquet"
-ADJACENCY_PATH = GRAPH_DIR / "adjacency_normalized.npz"
 NODE_FEATURES_OUTPUT_PATH = GRAPH_DIR / "node_features.npy"
 
 SPLIT_NAMES = ("train", "validation", "test")
@@ -156,15 +154,6 @@ def main() -> None:
     node_index = load_node_index()
     number_of_nodes = len(node_index)
     print(f"Total graph nodes: {number_of_nodes:,}")
-
-    if ADJACENCY_PATH.exists():
-        adjacency_shape = sp.load_npz(ADJACENCY_PATH).shape
-        if adjacency_shape[0] != number_of_nodes:
-            raise RuntimeError(
-                f"node_index.parquet has {number_of_nodes:,} nodes but "
-                f"adjacency_normalized.npz has shape {adjacency_shape} - out of sync, "
-                "rerun feature_extraction/prepare_hic_graph.py."
-            )
 
     print("\n[1/2] Building node_features.npy from DNABERT-2 node embeddings")
     dnabert_index, dnabert_embeddings = load_dnabert_node_features()

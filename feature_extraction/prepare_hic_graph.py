@@ -1,8 +1,8 @@
 """
 Build the 100kb-resolution Hi-C graph for the HepG2 GRCh38 genome:
   1. a node index (one row per 100kb bin, chr1-22 + chrX)
-  2. a normalized adjacency matrix (self-loops + symmetric degree
-     normalization, same convention as the original ncVarPred model),
+  2. a 4-feature O/E edge representation for GATv2Structure's attention
+     (see model/graph_branch_gat.py and compute_oe_edge_features below),
      intra-chromosomal contacts only (inter-chromosomal set to 0 - keeps
      the matrix tractable; a standard simplification for this kind of
      3D-genome-informed model)
@@ -39,7 +39,7 @@ from config.project_config import (
 )
 
 NODE_INDEX_PATH = GRAPH_DIR / "node_index.parquet"
-ADJACENCY_PATH = GRAPH_DIR / "adjacency_normalized.npz"
+EDGE_FEATURES_PATH = GRAPH_DIR / "edge_features.npz"
 
 
 def normalize_chromosome_name(name: str) -> str:
@@ -153,8 +153,8 @@ def build_raw_adjacency(node_index: pd.DataFrame, hic_file, raw_names: dict[str,
         # converge for every bin (typically very low-coverage or
         # blacklisted/repetitive regions) - hic-straw returns NaN counts for
         # contacts touching those bins rather than raising. Drop them here
-        # (silently keeping them would poison the whole degree-normalization
-        # step downstream - see normalize_adjacency - and trip its own
+        # (silently keeping them would poison compute_oe_edge_features'
+        # distance-pooled O/E averages downstream and trip its own
         # np.isfinite check anyway, just with a much less informative error).
         finite_mask = np.isfinite(counts)
         dropped = len(counts) - int(finite_mask.sum())
@@ -242,8 +242,9 @@ def apply_top_k_sparsification(adjacency: sp.coo_matrix, top_k: int) -> sp.coo_m
     .maximum() with the transpose, not intersection) - otherwise a real
     but asymmetric-in-rank contact could vanish entirely just because node
     i has many strong neighbors crowding it out while node j doesn't.
-    Self-loops aren't affected - they're added later in normalize_adjacency,
-    after this function runs on the raw (self-loop-free) contacts.
+    Self-loops aren't affected - they're added later in
+    compute_oe_edge_features, after this function runs on the raw
+    (self-loop-free) contacts.
     """
     csr = adjacency.tocsr()
     rows_out: list[np.ndarray] = []
@@ -279,17 +280,16 @@ def compute_oe_edge_features(adjacency: sp.coo_matrix, resolution: int) -> tuple
     (see model/graph_branch_gat.py) - [log1p(KR/SCALE-normalized count),
     observed/expected ratio, log1p(genomic distance in bp), is_self_loop] -
     from the already top-k-sparsified adjacency `build_raw_adjacency`
-    returns (BEFORE normalize_adjacency's self-loops + GCN-style degree
-    normalization - that degree-normalized value conflates true contact
-    strength with how connected a node is overall, the wrong signal to
-    feed GATv2Conv's attention as an edge feature; the raw, bias-corrected-
-    but-not-degree-normalized count here is the right one). Self-loops are
-    added explicitly here instead (one per node, features
+    returns - a degree-normalized value (the old GCN_Structure's own
+    convention, since removed - see project history) would conflate true
+    contact strength with how connected a node is overall, the wrong signal
+    to feed GATv2Conv's attention as an edge feature; the raw, bias-
+    corrected-but-not-degree-normalized count here is the right one.
+    Self-loops are added explicitly here (one per node, features
     [0, 1.0, 0, 1] - no real Hi-C signal, O/E=1.0 as a neutral/"as
     expected" placeholder, flagged via is_self_loop rather than faked with
     a made-up contact-strength value), since GATv2Structure is built with
-    add_self_loops=False and expects to receive them pre-added, same
-    convention as the old single-value adjacency_normalized.npz.
+    add_self_loops=False and expects to receive them pre-added.
 
     Distance is computed directly from row/col node-index difference - no
     extra lookup needed, since this adjacency only ever contains intra-
@@ -362,24 +362,6 @@ def compute_oe_edge_features(adjacency: sp.coo_matrix, resolution: int) -> tuple
     return rows.astype(np.int64), cols.astype(np.int64), features
 
 
-def normalize_adjacency(adjacency: sp.coo_matrix) -> sp.csr_matrix:
-    """Original ncVarPred normalization: A + I, then symmetric degree normalization."""
-    adjacency = adjacency + sp.eye(adjacency.shape[0], dtype=np.float32, format="coo")
-
-    row_sum = np.asarray(adjacency.sum(axis=1)).reshape(-1)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        degree_inverse_sqrt = np.power(row_sum, -0.5)
-
-    degree_inverse_sqrt[~np.isfinite(degree_inverse_sqrt)] = 0.0
-
-    degree_matrix = sp.diags(degree_inverse_sqrt)
-
-    normalized = adjacency.dot(degree_matrix).transpose().dot(degree_matrix)
-
-    return normalized.tocsr()
-
-
 def main() -> None:
     print("=" * 70)
     print("Building the HepG2 100kb Hi-C graph (GRCh38)")
@@ -401,18 +383,13 @@ def main() -> None:
     raw_adjacency = build_raw_adjacency(node_index, hic_file, raw_names)
     print(f"Raw adjacency non-zero entries: {raw_adjacency.nnz:,}")
 
-    print("\n[3/3] Normalizing adjacency (self-loops + symmetric degree norm)")
-    normalized_adjacency = normalize_adjacency(raw_adjacency)
-
-    if not np.isfinite(normalized_adjacency.data).all():
-        raise RuntimeError("Normalized adjacency contains NaN or infinite values.")
-
-    sp.save_npz(ADJACENCY_PATH, normalized_adjacency)
-    print(f"Saved: {ADJACENCY_PATH}")
+    print("\n[3/3] Computing O/E edge features (log1p(count), O/E, log1p(distance), is_self_loop) - for GATv2Structure")
+    edge_rows, edge_cols, edge_features = compute_oe_edge_features(raw_adjacency, GRAPH_RESOLUTION)
+    np.savez_compressed(EDGE_FEATURES_PATH, rows=edge_rows, cols=edge_cols, features=edge_features)
+    print(f"Saved: {EDGE_FEATURES_PATH}  ({len(edge_rows):,} edges incl. self-loops, {edge_features.shape[1]} features/edge)")
 
     print("\nHi-C graph construction completed.")
     print(f"Nodes: {len(node_index):,}")
-    print(f"Adjacency non-zero entries (post-normalization): {normalized_adjacency.nnz:,}")
 
 
 if __name__ == "__main__":

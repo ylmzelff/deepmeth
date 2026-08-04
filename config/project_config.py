@@ -99,15 +99,24 @@ PHYSICOCHEMICAL_SHARD_SIZE = 50_000
 # Hi-C / graph branch
 # ============================================================
 
-# 25kb, not the original 100kb: feature_extraction/analyze_graph_node_label_purity.py's
-# majority-vote-per-node oracle (the real theoretical ceiling for a graph
-# branch that gives every CpG in a node the SAME embedding) was only
-# MCC~0.50 at 100kb, versus MCC~0.69 at 25kb (validation, GM12878) - 100kb
-# bins were mixing ~40 CpGs of often-conflicting labels together. See
-# feature_extraction/preview_graph_resolution_gm12878.py for the cheap
-# (no Hi-C reading, no DNABERT) way this was checked before committing to
-# the real, expensive rebuild at this resolution.
-GRAPH_RESOLUTION = 25_000
+# 10kb, not 25kb or 100kb: the majority-vote-per-node oracle (the real
+# theoretical ceiling for a graph branch that gives every CpG in a node the
+# SAME embedding - computed cheaply from disjoint_split/validation.parquet
+# alone, no Hi-C reading or DNABERT needed) rises monotonically as bins get
+# finer: MCC~0.50 @ 100kb, ~0.69 @ 25kb, ~0.77 @ 10kb (validation, GM12878).
+# Every GATv2 variant tried at 25kb (O/E edge features, LayerNorm, node
+# position/sample_count features, self-supervised Hi-C pretraining - see
+# project history) converged to the same ~0.55-0.58 MCC band regardless of
+# which of those was added, consistent with all of them bumping into the
+# 25kb oracle's ceiling rather than being architecturally limited - the
+# ceiling itself, not the model, was the bottleneck.
+#
+# Finer than 10kb isn't available for GM12878's .hic file (ENCFF355OWW):
+# feature_extraction/check_hic_resolutions_gm12878.py showed 5kb is stored
+# but returns zero KR-normalized records for chr1 (unusable), and 2kb/1kb
+# aren't stored at all - 10kb is the finest resolution this file actually
+# supports.
+GRAPH_RESOLUTION = 10_000
 GRAPH_INTRA_CHROMOSOME_ONLY = True  # inter-chromosomal contacts set to 0 (tractability)
 
 # Maximum genomic distance (bp) between two bins for their Hi-C contact to be
@@ -140,12 +149,12 @@ HIC_MAX_CONTACT_DISTANCE_BP = 5_000_000
 HIC_TOP_K_NEIGHBORS = 32
 
 # Hi-C matrix balancing applied by hic-straw before we read contact counts -
-# NOT the same thing as the GCN-style symmetric degree normalization applied
-# afterward in prepare_hic_graph.py's normalize_adjacency (that corrects for
-# per-NODE degree in the graph; this corrects for per-BIN sequencing/mappability/
-# GC bias in the raw Hi-C reads themselves - both apply, for different reasons).
-# Raw ("NONE") counts were used originally, which conflates true 3D contact
-# frequency with distance-decay and coverage artifacts.
+# corrects for per-BIN sequencing/mappability/GC bias in the raw Hi-C reads
+# themselves (separate from compute_oe_edge_features' observed/expected
+# step, which corrects for genomic-distance decay instead - both apply, for
+# different reasons). Raw ("NONE") counts were used originally, which
+# conflates true 3D contact frequency with distance-decay and coverage
+# artifacts.
 #
 # SCALE, not KR: Knight & Ruiz (2013) / Rao et al. 2014 introduced KR
 # balancing as the original Hi-C convention, but Aiden Lab's own Juicer
@@ -161,7 +170,6 @@ HIC_TOP_K_NEIGHBORS = 32
 # SCALE normalization vectors for one or both chromosomes at 100000 BP"
 # when this was set to "SCALE" - using the documented fallback.
 HIC_NORMALIZATION_TYPE = "KR"
-NODE_FEATURE_DIM = 768  # DNABERT-2 hidden size
 
 # ============================================================
 # DNABERT-2 (model/tokenizer settings unchanged)
@@ -287,7 +295,18 @@ elif DATASET == "GM12878":
     # HepG2's CHECKPOINT_DIR/RESULTS_DIR above) - see
     # download_data_gm12878.py's docstring: that PROJECT_ROOT-relative
     # pattern is what lost HepG2 checkpoints across a Colab disconnect once.
-    ACTIVE_CHECKPOINT_DIR = _GM12878_DATA_DIR / "checkpoints" / "full_model_warmstart_disjoint_split"
+    #
+    # Bumped from full_model_warmstart_disjoint_split to
+    # full_model_gatv2_cpg_readout_10kb once model/deepmeth_model.py's
+    # structure_branch became GATv2Structure + CpGAwareGraphReadout (was
+    # GCN_Structure) - the old directory's last_checkpoint.pt has
+    # incompletely different weight shapes (different layer names entirely,
+    # not just a dimension change), so resuming from it would crash the
+    # same way earlier GATv2/checkpoint-shape transitions in this project
+    # did (see training/train_graph_gat.py's own CHECKPOINT_SUBDIR history)
+    # - a new directory avoids that and keeps the old GCN-based result
+    # (val_mcc 0.6636-0.6653) on disk for comparison.
+    ACTIVE_CHECKPOINT_DIR = _GM12878_DATA_DIR / "checkpoints" / "full_model_gatv2_cpg_readout_10kb"
     ACTIVE_RESULTS_DIR = _GM12878_DATA_DIR / "results"
 
     # GM12878-tuned values (found via the sequence-branch hyperparameter
@@ -306,12 +325,20 @@ elif DATASET == "GM12878":
     ACTIVE_UNFREEZE_LEARNING_RATE = 1e-05
     ACTIVE_WARMUP_FROZEN_EPOCHS = 5
     ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH = _GM12878_DATA_DIR / "checkpoints" / "sequence_only" / "best_model.pt"
-    ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH = _GM12878_DATA_DIR / "checkpoints" / "graph_only" / "best_model.pt"
+    # graph_gat_10kb, not the old GCN-based "graph_only": structure_branch is
+    # GATv2Structure now (see model/deepmeth_model.py), and this checkpoint
+    # is produced by training/train_graph_gat.py in the raw, unprefixed
+    # state_dict format training/train.py's load_structure_branch_weights
+    # expects (not load_branch_weights' "model_state_dict" + prefix format
+    # the old graph_only/best_model.pt used).
+    ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH = (
+        _GM12878_DATA_DIR / "checkpoints" / "graph_gat_10kb" / "structure_branch_pretrained.pt"
+    )
     ACTIVE_PHYSICOCHEMICAL_ONLY_CHECKPOINT_PATH = (
         _GM12878_DATA_DIR / "checkpoints" / "physicochemical_only" / "best_model.pt"
     )
 
-    ACTIVE_HISTORY_FILENAME = "training_history_full_warmstart_disjoint_split.json"
+    ACTIVE_HISTORY_FILENAME = "training_history_full_gatv2_cpg_readout_10kb.json"
 
 else:
     raise ValueError(f"Unknown DATASET={DATASET!r} - expected 'HEPG2' or 'GM12878'.")

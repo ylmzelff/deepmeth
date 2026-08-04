@@ -48,7 +48,9 @@ express. Combined here with:
 
 Requires (Colab): !pip install torch_geometric
 
-Input:  node_input  [N, 768]  (unchanged - same DNABERT-2 node features)
+Input:  node_input  [N, NODE_FEATURE_DIM]  (DNABERT-2 embedding + chromosome
+                               one-hot + normalized position + normalized
+                               sample_count - see NODE_FEATURE_DIM above)
         edge_index  [2, E]    (see load_oe_edge_index below - reads
                                edge_features.npz, produced once by
                                feature_extraction/prepare_hic_graph.py's
@@ -69,6 +71,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
+
+from config.project_config import DNABERT_HIDDEN_SIZE, INCLUDED_CHROMOSOMES
+
+# Node feature width: the 768-d DNABERT-2 embedding plus 3 kinds of cheap,
+# leak-free positional/confidence features appended by
+# feature_extraction/prepare_graph_features_gm12878.py's
+# build_extra_node_features - chromosome one-hot (len(INCLUDED_CHROMOSOMES)
+# dims), normalized position within chromosome (1 dim), normalized
+# sample_count (1 dim, how many CG windows were averaged into this node's
+# embedding - previously computed but discarded, see project history).
+# Derived from the same config constant that script uses (not imported
+# from it directly, to avoid a model/ -> feature_extraction/ dependency)
+# so both stay in sync automatically if INCLUDED_CHROMOSOMES ever changes.
+EXTRA_NODE_FEATURE_DIM = len(INCLUDED_CHROMOSOMES) + 2
+NODE_FEATURE_DIM = DNABERT_HIDDEN_SIZE + EXTRA_NODE_FEATURE_DIM
 
 # Lowered from an initial 256/4 after a real run OOM'd at ~95GB: GATv2Conv's
 # attention computation materializes several [E, heads, out_channels]
@@ -108,7 +125,8 @@ class GATv2Structure(nn.Module):
 
     Inputs:
         node_input:
-            DNABERT-2 node features [N, 768].
+            DNABERT-2 + positional/confidence node features
+            [N, NODE_FEATURE_DIM] (see NODE_FEATURE_DIM above).
 
         edge_index:
             Graph connectivity [2, E] (long tensor).
@@ -128,7 +146,7 @@ class GATv2Structure(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.input_projection = nn.Linear(768, HIDDEN_DIM)
+        self.input_projection = nn.Linear(NODE_FEATURE_DIM, HIDDEN_DIM)
 
         # concat=False: average the attention heads back to HIDDEN_DIM
         # instead of concatenating them (which would multiply the width by
@@ -145,6 +163,15 @@ class GATv2Structure(nn.Module):
 
         self.dropout = nn.Dropout(p=DROPOUT_PROB)
 
+        # Post-norm (applied after the residual add, not before the GATv2
+        # layer) - standard practice for stabilizing residual GNN training
+        # (e.g. GraphGPS), cheap to add for a 2-layer network like this one.
+        # Safe with full-graph, fixed-size batches (every forward pass sees
+        # all N nodes, unlike a padded variable-length minibatch where
+        # LayerNorm statistics could be skewed by padding).
+        self.norm1 = nn.LayerNorm(HIDDEN_DIM)
+        self.norm2 = nn.LayerNorm(HIDDEN_DIM)
+
         # Jumping Knowledge: concatenate the pre-GAT projection + both GAT
         # layers' outputs (3 x HIDDEN_DIM) instead of reading out only the
         # last layer.
@@ -157,13 +184,13 @@ class GATv2Structure(nn.Module):
         edge_attr: torch.Tensor,
         node_index: torch.Tensor,
     ) -> torch.Tensor:
-        h0 = F.elu(self.input_projection(node_input))  # [N, 768] -> [N, HIDDEN_DIM]
+        h0 = F.elu(self.input_projection(node_input))  # [N, NODE_FEATURE_DIM] -> [N, HIDDEN_DIM]
 
-        h1 = F.elu(self.gat1(h0, edge_index, edge_attr)) + h0
-        h1 = self.dropout(h1)
+        message1 = self.gat1(h0, edge_index, edge_attr)
+        h1 = self.norm1(h0 + self.dropout(F.elu(message1)))
 
-        h2 = F.elu(self.gat2(h1, edge_index, edge_attr)) + h1
-        h2 = self.dropout(h2)
+        message2 = self.gat2(h1, edge_index, edge_attr)
+        h2 = self.norm2(h1 + self.dropout(F.elu(message2)))
 
         jumping_knowledge = torch.cat([h0, h1, h2], dim=1)  # [N, HIDDEN_DIM * 3]
         structure_output = self.readout(jumping_knowledge)  # [N, 128]
