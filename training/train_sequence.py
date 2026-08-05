@@ -18,15 +18,17 @@ This is a *warm start*, not a frozen/fixed branch: training/train.py
 loads this checkpoint's weights into model.sequence_branch and then
 continues to fine-tune it jointly with the other two branches as normal.
 
-IMPORTANT: USE_SELF_ATTENTION below must match whatever
-use_sequence_self_attention value training/train.py's DeepMethModel
-construction uses - the saved state_dict's shapes depend on which
-internal architecture (BiLSTM vs self-attention) was used, and loading
-into a mismatched architecture will fail.
+IMPORTANT: USE_SEQUENCE_SELF_ATTENTION and USE_SEQUENCE_MULTISCALE_CNN
+(config.project_config) must match whatever values training/train.py's
+DeepMethModel construction uses - the saved state_dict's shapes depend on
+which internal architecture was used, and loading into a mismatched
+architecture will fail. See CHECKPOINT_SUBDIR below for how a non-default
+combination is kept from overwriting the checkpoint train.py actually
+warm-starts from.
 
 Usage (no arguments needed):
 
-    python training/pretrain_sequence.py
+    python training/train_sequence.py
 """
 
 from __future__ import annotations
@@ -51,7 +53,8 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 
 from config.project_config import (
-    CHECKPOINT_DIR,
+    ACTIVE_RESULTS_DIR,
+    ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH,
     DEVICE,
     EARLY_STOPPING_MIN_DELTA,
     EARLY_STOPPING_PATIENCE,
@@ -60,39 +63,65 @@ from config.project_config import (
     FUSION_HIDDEN_DIM,
     LEARNING_RATE,
     LOG_INTERVAL_SECONDS,
-    RESULTS_DIR,
     SEQUENCE_BRANCH_OUTPUT_DIM,
     TRAINING_SEED,
+    USE_SEQUENCE_MULTISCALE_CNN,
     USE_SEQUENCE_SELF_ATTENTION,
     WEIGHT_DECAY,
 )
 from model.sequence_branch import DanQ_Sequence
 from training.train import build_loader, resolve_pos_weight, set_seed
 
-# Re-exported under this file's original name for anything still importing
-# it from here - the actual value lives in config.project_config now (both
-# this file and training/train.py import it from there, which is what
-# actually keeps them in sync; importing it from each other would be
-# circular).
-USE_SELF_ATTENTION = USE_SEQUENCE_SELF_ATTENTION
+# Checkpoint directory is versioned by which architecture toggles are
+# active (same reasoning as training/train_graph_gat.py's CHECKPOINT_SUBDIR
+# history - see project history): the default (both toggles False) writes
+# to exactly ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH's directory, so
+# training/train.py's warm-start keeps working unchanged. A non-default
+# combination (e.g. USE_SEQUENCE_MULTISCALE_CNN=True) writes to a clearly
+# separate directory instead, so an experimental run can never silently
+# overwrite the checkpoint train.py actually warm-starts from. To promote a
+# new variant, update ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH in
+# config/project_config.py to point at its directory once it's decided.
+#
+# Previously pointed at CHECKPOINT_DIR (PROJECT_ROOT-relative, not the
+# Drive-mounted ACTIVE_CHECKPOINT_DIR family) and saved a separately-named,
+# unprefixed SEQUENCE_BRANCH_WEIGHTS_PATH file that training/train.py never
+# actually read - training/train.py's real warm-start load_branch_weights()
+# call reads ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH ("model_state_dict" +
+# "sequence_branch." prefix format, which BEST_CHECKPOINT_PATH below
+# already produces via SequenceOnlyModel.state_dict()) - fixed to point
+# there directly instead of duplicating the path in two places that could
+# (and did) drift out of sync.
+_VARIANT_SUFFIX = (
+    ("_selfattn" if USE_SEQUENCE_SELF_ATTENTION else "")
+    + ("_multiscale" if USE_SEQUENCE_MULTISCALE_CNN else "")
+)
+if _VARIANT_SUFFIX:
+    CHECKPOINT_SUBDIR = ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH.parent.parent / f"sequence_only{_VARIANT_SUFFIX}"
+    BEST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model.pt"
+else:
+    CHECKPOINT_SUBDIR = ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH.parent
+    BEST_CHECKPOINT_PATH = ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH
 
-CHECKPOINT_SUBDIR = CHECKPOINT_DIR / "sequence_pretrain"
 LAST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "last_checkpoint.pt"
-BEST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model.pt"
-
-# What training/train.py actually loads for warm-start - just the
-# sequence_branch weights, not the head/optimizer/etc.
-SEQUENCE_BRANCH_WEIGHTS_PATH = CHECKPOINT_DIR / "sequence_branch_pretrained.pt"
-
-HISTORY_PATH = RESULTS_DIR / "training_history_sequence_pretrain.json"
+HISTORY_PATH = ACTIVE_RESULTS_DIR / f"training_history_sequence_only{_VARIANT_SUFFIX}.json"
 
 
 class SequenceOnlyModel(nn.Module):
     """Sequence branch + a small linear head, for standalone pretraining only."""
 
-    def __init__(self, use_self_attention: bool, head_hidden_dim: int, head_dropout_prob: float):
+    def __init__(
+        self,
+        use_self_attention: bool,
+        use_multiscale_cnn: bool,
+        head_hidden_dim: int,
+        head_dropout_prob: float,
+    ):
         super().__init__()
-        self.sequence_branch = DanQ_Sequence(use_self_attention=use_self_attention)
+        self.sequence_branch = DanQ_Sequence(
+            use_self_attention=use_self_attention,
+            use_multiscale_cnn=use_multiscale_cnn,
+        )
         self.head = nn.Sequential(
             nn.Linear(SEQUENCE_BRANCH_OUTPUT_DIM, head_hidden_dim),
             nn.ReLU(),
@@ -181,11 +210,13 @@ def main() -> None:
     set_seed(TRAINING_SEED)
 
     CHECKPOINT_SUBDIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Pretraining sequence branch alone (use_self_attention={USE_SELF_ATTENTION})")
+    print(f"Pretraining sequence branch alone (use_self_attention={USE_SEQUENCE_SELF_ATTENTION}, "
+          f"use_multiscale_cnn={USE_SEQUENCE_MULTISCALE_CNN})")
+    print(f"Checkpoint directory: {CHECKPOINT_SUBDIR}")
 
     print("\n[1/3] Building datasets")
     train_dataset, train_loader = build_loader("train", shuffle=True)
@@ -196,7 +227,8 @@ def main() -> None:
 
     print("\n[2/3] Building model")
     model = SequenceOnlyModel(
-        use_self_attention=USE_SELF_ATTENTION,
+        use_self_attention=USE_SEQUENCE_SELF_ATTENTION,
+        use_multiscale_cnn=USE_SEQUENCE_MULTISCALE_CNN,
         head_hidden_dim=FUSION_HIDDEN_DIM,
         head_dropout_prob=FUSION_DROPOUT,
     ).to(device)
@@ -244,15 +276,17 @@ def main() -> None:
         if improved:
             best_validation_loss = validation_metrics["loss"]
             patience_counter = 0
+            # This is the file training/train.py's load_branch_weights()
+            # actually reads for warm-start (when CHECKPOINT_SUBDIR resolves
+            # to ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH's directory - see its
+            # definition above) - "model_state_dict" + "sequence_branch."-
+            # prefixed keys, exactly what SequenceOnlyModel.state_dict()
+            # already produces, no separate unprefixed file needed.
             torch.save(
                 {"epoch": epoch, "model_state_dict": model.state_dict(), "validation_metrics": validation_metrics},
                 BEST_CHECKPOINT_PATH,
             )
-            # This is the file training/train.py actually consumes for warm-start -
-            # only the sequence_branch sub-module's weights, saved fresh every time
-            # a new best is found.
-            torch.save(model.sequence_branch.state_dict(), SEQUENCE_BRANCH_WEIGHTS_PATH)
-            print(f"  New best validation loss: {best_validation_loss:.4f} -> saved {SEQUENCE_BRANCH_WEIGHTS_PATH}")
+            print(f"  New best validation loss: {best_validation_loss:.4f} -> saved {BEST_CHECKPOINT_PATH}")
         else:
             patience_counter += 1
 
@@ -277,7 +311,7 @@ def main() -> None:
 
     print("\nSequence pretraining completed.")
     print(f"Best validation loss: {best_validation_loss:.4f}")
-    print(f"Sequence branch weights for warm-start: {SEQUENCE_BRANCH_WEIGHTS_PATH}")
+    print(f"Sequence branch checkpoint for warm-start: {BEST_CHECKPOINT_PATH}")
 
 
 if __name__ == "__main__":

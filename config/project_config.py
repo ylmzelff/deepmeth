@@ -193,8 +193,25 @@ DNABERT_MAX_CPG_PER_NODE = 64
 # internal architecture (BiLSTM vs self-attention) was used. Living here
 # (one place) instead of being duplicated as a local constant in each
 # training script is what makes that "must match" guarantee actually hold.
-# BiLSTM (False) won the GM12878 ablation - see project history.
+#
+# BiLSTM (False) reached a better result in the one GM12878 ablation run so
+# far (see project history) - but that run used a fixed LR with no warmup/
+# scheduler for either variant, and self-attention's validation curve was
+# noisy in a way consistent with the well-known LR-sensitivity of
+# Transformers trained without warmup (Vaswani et al., 2017), not
+# necessarily an architectural loss. Left False (safer, proven path) rather
+# than re-litigated here - a fair rematch (with warmup) is a separate,
+# not-yet-done experiment.
 USE_SEQUENCE_SELF_ATTENTION = False
+
+# use_multiscale_cnn - see model/sequence_branch.py's DanQ_Sequence
+# docstring: parallel Conv1d branches (kernel sizes 8/16/26/34) instead of
+# the original single kernel_size=26 conv, concatenated along the channel
+# dimension. Same "must match everywhere a checkpoint crosses this
+# argument" rule as USE_SEQUENCE_SELF_ATTENTION above, same reason it lives
+# here as a single shared constant. Not yet benchmarked - default False
+# reproduces the original single-branch conv exactly.
+USE_SEQUENCE_MULTISCALE_CNN = True
 
 SEQUENCE_BRANCH_OUTPUT_DIM = 925
 GRAPH_BRANCH_OUTPUT_DIM = 128

@@ -51,17 +51,21 @@ class DeepMethModel(nn.Module):
         fusion_hidden_dim: int,
         fusion_dropout_prob: float,
         use_sequence_self_attention: bool = False,
+        use_sequence_multiscale_cnn: bool = False,
         use_physchem_property_gate: bool = False,
         graph_readout_dropout_prob: float = 0.2,
     ):
         super(DeepMethModel, self).__init__()
 
         # ncVarPred DanQ-based sequence branch. use_sequence_self_attention
-        # swaps the BiLSTM for a lightweight Transformer encoder over the
-        # same 36 CNN positions - see model/sequence_branch.py. Default
-        # False reproduces the original DanQ path unchanged.
+        # swaps the BiLSTM for a lightweight Transformer encoder;
+        # use_sequence_multiscale_cnn swaps the single kernel_size=26 conv
+        # for parallel multi-scale conv branches - see
+        # model/sequence_branch.py. Both default False, reproducing the
+        # original DanQ path unchanged.
         self.sequence_branch = DanQ_Sequence(
-            use_self_attention=use_sequence_self_attention
+            use_self_attention=use_sequence_self_attention,
+            use_multiscale_cnn=use_sequence_multiscale_cnn,
         )
 
         # GATv2-based structure branch (see model/graph_branch_gat.py) +

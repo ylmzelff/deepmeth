@@ -97,6 +97,7 @@ from config.project_config import (
     PHYSCHEM_DROPOUT,
     POS_WEIGHT_MODE,
     TRAINING_SEED,
+    USE_SEQUENCE_MULTISCALE_CNN,
     USE_SEQUENCE_SELF_ATTENTION,
 )
 from model.deepmeth_model import DeepMethModel
@@ -236,6 +237,7 @@ def run_epoch(
     criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    scaler: torch.amp.GradScaler,
     phase_name: str,
 ) -> dict:
     is_training = optimizer is not None
@@ -258,19 +260,26 @@ def run_epoch(
             node_index = batch["node_index"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
-            logits = model(
-                seq_input=sequence_input,
-                node_input=node_features,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                node_index=node_index,
-                physchem_input=physchem_input,
-            ).squeeze(1)
+            # Mixed precision: GATv2Structure's attention over the full Hi-C
+            # graph (E=8.9M edges at 10kb - see model/graph_branch_gat.py)
+            # already needed this to avoid OOM standalone in
+            # training/train_graph_gat.py; running it here, inside the full
+            # fusion model's backward graph alongside the sequence/physchem
+            # branches, needs it even more.
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(
+                    seq_input=sequence_input,
+                    node_input=node_features,
+                    edge_index=edge_index,
+                    edge_attr=edge_attr,
+                    node_index=node_index,
+                    physchem_input=physchem_input,
+                ).squeeze(1)
 
-            # This is what gets logged/compared across epochs and runs -
-            # kept free of the L1 penalty term below so metrics stay
-            # comparable regardless of ACTIVE_L1_LAMBDA.
-            prediction_loss = criterion(logits, labels)
+                # This is what gets logged/compared across epochs and runs -
+                # kept free of the L1 penalty term below so metrics stay
+                # comparable regardless of ACTIVE_L1_LAMBDA.
+                prediction_loss = criterion(logits, labels)
 
             if is_training:
                 training_loss = prediction_loss
@@ -280,7 +289,9 @@ def run_epoch(
                     # to the fusion (FC) and graph structure layers, not the
                     # conv/BiLSTM/physicochemical branches - matched here
                     # (structure_branch is GATv2Structure now, not the
-                    # original GCN, but the same scope applies).
+                    # original GCN, but the same scope applies). Computed
+                    # outside autocast, directly on the (always fp32)
+                    # parameters - independent of the forward pass' dtype.
                     l1_penalty = sum(
                         parameter.abs().sum()
                         for module in (model.fusion, model.structure_branch)
@@ -289,12 +300,16 @@ def run_epoch(
                     training_loss = training_loss + ACTIVE_L1_LAMBDA * l1_penalty
 
                 optimizer.zero_grad()
-                training_loss.backward()
+                scaler.scale(training_loss).backward()
+                # Unscale before clipping - clip_grad_norm_ needs to see the
+                # real gradient magnitudes, not the scaler's inflated ones.
+                scaler.unscale_(optimizer)
                 # Caps the rare large-gradient batch (BiLSTM/GATv2 stacks can
                 # produce one) from knocking the model out of a good region
                 # in a single step; a no-op on normal small-gradient steps.
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
             batch_size = labels.shape[0]
             total_loss += prediction_loss.item() * batch_size
@@ -361,16 +376,25 @@ def main() -> None:
 
     pos_weight = resolve_pos_weight(train_dataset)
 
-    print(f"\n[3/5] Building model (use_sequence_self_attention={USE_SEQUENCE_SELF_ATTENTION})")
+    print(f"\n[3/5] Building model (use_sequence_self_attention={USE_SEQUENCE_SELF_ATTENTION}, "
+          f"use_sequence_multiscale_cnn={USE_SEQUENCE_MULTISCALE_CNN})")
     model = DeepMethModel(
         physchem_dropout_prob=PHYSCHEM_DROPOUT,
         fusion_projected_dim=FUSION_PROJECTED_DIM,
         fusion_hidden_dim=FUSION_HIDDEN_DIM,
         fusion_dropout_prob=FUSION_DROPOUT,
         use_sequence_self_attention=USE_SEQUENCE_SELF_ATTENTION,
+        use_sequence_multiscale_cnn=USE_SEQUENCE_MULTISCALE_CNN,
     ).to(device)
 
-    if ACTIVE_WARM_START:
+    # Skipped entirely when resuming (see LAST_CHECKPOINT_PATH.exists() below) -
+    # that checkpoint's model_state_dict already reflects this warm start plus
+    # however much further training happened since, so loading the standalone
+    # checkpoints here first would just be immediately overwritten by it.
+    resuming = LAST_CHECKPOINT_PATH.exists()
+    if resuming:
+        print(f"\n[4/5] Resuming from {LAST_CHECKPOINT_PATH} - skipping standalone-checkpoint warm-start")
+    elif ACTIVE_WARM_START:
         print("\n[4/5] Warm-starting branches from standalone checkpoints")
         load_branch_weights(model.sequence_branch, ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH, "sequence_branch.", device)
         load_structure_branch_weights(model.structure_branch, ACTIVE_GRAPH_ONLY_CHECKPOINT_PATH, device)
@@ -379,6 +403,7 @@ def main() -> None:
         print("\n[4/5] No warm-start for this dataset - training from scratch")
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+    scaler = torch.amp.GradScaler(device="cuda")
 
     start_epoch = 0
     best_validation_loss = float("inf")
@@ -397,8 +422,7 @@ def main() -> None:
     else:
         optimizer, scheduler = build_optimizer_and_scheduler(model, ACTIVE_LEARNING_RATE)
 
-    if LAST_CHECKPOINT_PATH.exists():
-        print(f"\nResuming from {LAST_CHECKPOINT_PATH}")
+    if resuming:
         checkpoint = torch.load(LAST_CHECKPOINT_PATH, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
@@ -414,6 +438,8 @@ def main() -> None:
 
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     print("\n[5/5] Training")
     for epoch in range(start_epoch, ACTIVE_EPOCHS):
@@ -427,13 +453,13 @@ def main() -> None:
 
         train_dataset.set_epoch(epoch)
         train_metrics = run_epoch(
-            model, train_loader, node_features, edge_index, edge_attr, criterion, device, optimizer,
+            model, train_loader, node_features, edge_index, edge_attr, criterion, device, optimizer, scaler,
             phase_name="train",
         )
 
         validation_dataset.set_epoch(epoch)
         validation_metrics = run_epoch(
-            model, validation_loader, node_features, edge_index, edge_attr, criterion, device, None,
+            model, validation_loader, node_features, edge_index, edge_attr, criterion, device, None, scaler,
             phase_name="validation",
         )
 
@@ -486,6 +512,7 @@ def main() -> None:
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "best_validation_loss": best_validation_loss,
                 "patience_counter": patience_counter,
                 "history": history,
