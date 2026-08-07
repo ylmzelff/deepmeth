@@ -25,3 +25,4 @@ checkpoints/
 
 # Reference genome / large downloads
 data/reference/*.2bit
+scripts

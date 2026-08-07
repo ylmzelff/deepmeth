@@ -1,25 +1,3 @@
-"""
-Extract a compact per-base code array for every CpG in
-train/validation/test.parquet - the cached, reusable raw material for the
-DanQ sequence branch's one-hot input.
-
-Each 501bp sequence is stored as 501 uint8 base codes (A/C/G/T -> 0-3,
-anything else, i.e. "N" -> UNKNOWN_BASE_CODE), not the expanded [4, 501]
-one-hot matrix. The one-hot matrix is trivial and fast to reconstruct from
-these codes at training time (see expand_codes_to_one_hot below).
-
-Shards are written with the exact same shard size and the exact same
-parquet row order as feature_extraction/extract_physicochemical.py, so
-shard k here lines up row-for-row with shard k of the physicochemical
-codes - training/dataset.py reads both in lockstep instead of re-deriving
-one from the other (physicochemical codes can't be losslessly reversed
-back into bases: "N"-containing dinucleotides all collapse to one sentinel
-code, so which side was "N" is lost).
-
-Usage (no arguments needed):
-
-    python feature_extraction/extract_sequence_codes.py
-"""
 
 from __future__ import annotations
 
@@ -73,9 +51,7 @@ def encode_sequences_to_base_codes(
 
 
 def expand_codes_to_one_hot(codes: np.ndarray) -> np.ndarray:
-    """Reconstruct the [N, 4, L] one-hot matrix from base codes (output of
-    encode_sequences_to_base_codes). UNKNOWN_BASE_CODE rows become all-zero.
-    """
+   
     number_of_bases = len(BASE_ORDER)
     # Row `number_of_bases` (i.e. index == UNKNOWN_BASE_CODE) is the all-zero fallback.
     identity_with_zero_row = np.vstack(
@@ -210,7 +186,7 @@ def main() -> None:
 
         if not parquet_path.exists():
             raise FileNotFoundError(
-                f"{parquet_path} does not exist. Run preprocessing/preprocess.py first."
+                f"{parquet_path} does not exist. Run preprocessing/preprocess_hepg2.py first."
             )
 
         print(f"\nProcessing split: {split_name}")

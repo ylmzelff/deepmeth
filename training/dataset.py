@@ -1,33 +1,3 @@
-"""
-Shard-streaming Dataset for the DeepMeth three-branch model.
-
-Dataset-agnostic: every path comes from config.project_config's ACTIVE_*
-constants, which resolve off the single DATASET switch there ("HEPG2" or
-"GM12878"). This class itself never hardcodes either dataset - same
-logic, same file layout convention, just a different root directory.
-
-Sequence-code shards (feature_extraction/extract_sequence_codes*.py) and
-physicochemical-code shards (feature_extraction/extract_physicochemical*.py)
-share identical shard boundaries and row order - both are produced by
-iterating the same split parquet with the same batch size - so they are
-read in lockstep by shard index rather than joined by key at every step.
-
-At construction time, every shard pair is checked once: (label, chrom,
-position) must agree between the two shard sources, and the graph node
-index recomputed from (chrom, position) must agree with the precomputed
-{split}_node_index.npy. This also yields the train-split label counts
-needed for pos_weight, in the same pass. __iter__ itself does no
-verification - it only decodes codes and yields samples - so the
-one-time cost isn't paid again every epoch.
-
-Because the shards are compressed .npz (not memory-mappable), sampling is
-a shard-streaming shuffle: shards are visited in random order (a new order
-each epoch, seeded by epoch number), decompressed one at a time, and rows
-are drawn from a fixed-size shuffle buffer. This isn't a fully global
-shuffle, but it keeps peak RAM bounded to a couple of shards' worth of
-rows instead of the whole split.
-"""
-
 from __future__ import annotations
 
 import json
@@ -104,11 +74,6 @@ class DeepMethShardDataset(IterableDataset):
         self.negative_count, self.positive_count = self._verify_alignment()
 
     def _physchem_shard_path(self, shard_record: dict) -> Path:
-        # Shard filenames are deterministic; reconstruct the path from the
-        # current config directory + basename instead of trusting the
-        # manifest's stored "file" field, which can be a stale absolute path
-        # from wherever/whenever the shard was originally written (e.g. a
-        # different mount point or host than the one running now).
         return self.physchem_dir / Path(shard_record["file"]).name
 
     def _sequence_shard_path(self, shard_record: dict) -> Path:
@@ -221,13 +186,6 @@ class DeepMethShardDataset(IterableDataset):
             one_hot = expand_codes_to_one_hot(sequence_codes)
 
             for row in range(row_count):
-                # .copy() is required: one_hot[row]/physchem_matrix[row] are numpy
-                # *views* into the full shard-sized array (basic indexing never
-                # copies). Without copying, every sample sitting in the shuffle
-                # buffer keeps its entire parent shard array alive - with shuffling
-                # scattering live references across many different shards at once,
-                # this pins the whole shard in memory for as long as any one of its
-                # rows remains buffered, which OOM-kills the worker after enough shards.
                 sample = (one_hot[row].copy(), physchem_matrix[row].copy(), int(node_indices[row]), int(labels[row]))
 
                 if not self.shuffle:

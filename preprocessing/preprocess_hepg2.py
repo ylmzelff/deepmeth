@@ -1,13 +1,3 @@
-"""
-Build the HepG2 WGBS consensus dataset: merge the two replicates' CpG
-methylation calls, extract GRCh38 sequence context, and split into
-chromosome-disjoint train/validation/test parquet files.
-
-Usage (no arguments needed):
-
-    python preprocessing/preprocess.py
-"""
-
 from __future__ import annotations
 
 import sys
@@ -19,19 +9,23 @@ import numpy as np
 import pandas as pd
 from twobitreader import TwoBitFile
 
+from config.data_config.hepg2_config import (
+    GRCH38_2BIT_PATH,
+    MAX_REPLICATE_RATIO_DIFFERENCE,
+    MIN_COVERAGE_PER_REPLICATE,
+    MIN_TOTAL_COVERAGE,
+    WGBS_REPLICATE_PATHS,
+)
 from config.project_config import (
     DATASET_DIR,
-    GRCH38_2BIT_PATH,
     INCLUDED_CHROMOSOMES,
     MAX_UNKNOWN_FRACTION,
-    MIN_COVERAGE_PER_REPLICATE,
     SEQUENCE_LENGTH,
     TEST_FRACTION,
     TRAIN_FRACTION,
     VALIDATION_FRACTION,
-    WGBS_REPLICATE_PATHS,
 )
-from preprocessing.analyze_data import load_bedmethyl
+from scripts.analyze_data import load_bedmethyl
 
 CENTER_INDEX = SEQUENCE_LENGTH // 2
 
@@ -92,11 +86,7 @@ def merge_strands_per_replicate(dataframe: pd.DataFrame, label: str) -> pd.DataF
         f"{len(merged):,} physical CpGs after strand merge"
     )
 
-    # Sanity check on the +/- strand coordinate convention: a correctly paired
-    # CpG should have strand_row_count == 2 (both strands found at the same
-    # canonical position). If most CpGs come out as strand_row_count == 1,
-    # the "+"/"-" offset assumption in add_canonical_position is likely wrong
-    # for this file, not a real single-strand coverage gap.
+    
     strand_support_counts = merged["strand_row_count"].value_counts().sort_index()
     two_strand_fraction = float(merged["strand_row_count"].eq(2).mean())
 
@@ -137,6 +127,11 @@ def load_and_prepare_replicate(path: Path, label: str) -> pd.DataFrame:
     dataframe = add_read_counts(dataframe)
     dataframe = add_canonical_position(dataframe)
     dataframe = merge_strands_per_replicate(dataframe, label)
+
+    # Needed by merge_replicates' replicate-ratio-difference filter below -
+    # same column GM12878's preprocess_gm12878.py computes at this point.
+    dataframe["methylation_ratio"] = dataframe["count_m"] / dataframe["coverage"].replace(0, np.nan)
+
     dataframe = filter_min_coverage(dataframe, label)
 
     return dataframe
@@ -159,6 +154,21 @@ def merge_replicates(replicate_1: pd.DataFrame, replicate_2: pd.DataFrame) -> pd
     merged["count_u"] = merged["count_u_rep1"] + merged["count_u_rep2"]
     merged["coverage"] = merged["count_m"] + merged["count_u"]
 
+    before = len(merged)
+    merged = merged[merged["coverage"] >= MIN_TOTAL_COVERAGE].reset_index(drop=True)
+    print(f"Combined coverage >= {MIN_TOTAL_COVERAGE}: kept {len(merged):,}/{before:,}")
+
+    merged["replicate_ratio_difference"] = (
+        merged["methylation_ratio_rep1"] - merged["methylation_ratio_rep2"]
+    ).abs()
+
+    before = len(merged)
+    merged = merged[merged["replicate_ratio_difference"] <= MAX_REPLICATE_RATIO_DIFFERENCE].reset_index(drop=True)
+    print(
+        f"Replicate ratio difference <= {MAX_REPLICATE_RATIO_DIFFERENCE}: "
+        f"kept {len(merged):,}/{before:,}"
+    )
+
     # Official grant-form label rule: methylated iff count_m > count_u, ties -> 0.
     merged["label"] = (merged["count_m"] > merged["count_u"]).astype("int8")
 
@@ -171,6 +181,7 @@ def merge_replicates(replicate_1: pd.DataFrame, replicate_2: pd.DataFrame) -> pd
             "count_m",
             "count_u",
             "coverage",
+            "replicate_ratio_difference",
             "label",
             "consensus_methylation_ratio",
         ]

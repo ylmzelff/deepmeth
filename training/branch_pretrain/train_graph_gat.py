@@ -1,30 +1,3 @@
-"""
-Pretrain the GATv2-based Hi-C graph branch (model/graph_branch_gat.py:
-GATv2Structure) alone, on the active dataset's train/validation split, and
-save its weights - same standalone-check-first pattern as the sequence
-branch scripts: verify this branch alone beats the old GCN_Structure's own
-standalone ceiling (val_mcc ~0.26 on GM12878 - see project history, a graph
-branch that weak was contributing almost nothing to the fused model) before
-deciding whether to fold it into the full model in place of GCN_Structure.
-
-Unlike the sequence-branch datasets, this one needs almost nothing per
-sample - just (node_index, label) pairs, since the actual node content
-(DNABERT-2 embeddings) and graph structure (Hi-C edges) are shared,
-resident-on-device tensors, identical for every sample landing on the same
-node. No shard-streaming needed (unlike training/dataset.py): the full
-(node_index, label) arrays for even GM12878's largest split are a few MB,
-so this loads directly into memory from the disjoint_split parquet + the
-existing {split}_node_index.npy (same files training/dataset.py already
-trusts, cross-checked once by feature_extraction/audit_graph_features_gm12878.py).
-
-Requires: !pip install torch_geometric (in addition to whatever this
-project already needs)
-
-Usage (no arguments needed):
-
-    python training/train_graph_gat.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -32,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -54,6 +27,7 @@ from config.project_config import (
     ACTIVE_SPLIT_NODE_INDEX_DIR,
     DEVICE,
     EARLY_STOPPING_MIN_DELTA,
+    GRAPH_BRANCH_OUTPUT_DIM,
     LOG_INTERVAL_SECONDS,
     LR_SCHEDULER_FACTOR,
     LR_SCHEDULER_MIN_LR,
@@ -75,63 +49,16 @@ HEAD_DROPOUT_PROB = 0.3
 NODE_FEATURES_PATH = ACTIVE_GRAPH_DIR / "node_features.npy"
 EDGE_FEATURES_PATH = ACTIVE_GRAPH_DIR / "edge_features.npz"
 
-# "graph_gat_oe_only", not the original "graph_gat_only": the O/E edge
-# feature change makes GATv2Conv's edge_dim 4 instead of 1, so its internal
-# weight shapes changed - loading the old checkpoint here would fail with a
-# shape mismatch anyway, but using a separate directory also means the
-# earlier single-edge-value run's checkpoint (val_mcc ~0.57-0.58) is kept
-# on disk untouched, for a direct before/after comparison.
-#
-# Bumped again from graph_gat_oe_only to graph_gat_oe_ln_nodefeat: adding
-# LayerNorm + the chromosome/position/sample_count node features changed
-# GATv2Structure.input_projection's shape (768 -> NODE_FEATURE_DIM=793, see
-# model/graph_branch_gat.py) and added norm1/norm2 - graph_gat_oe_only's
-# checkpoint is incompatible for the same reason as above, so it's kept
-# on disk untouched too, for a three-way before/after/after comparison.
-# (Result: best_val_loss=0.6394, best_val_mcc=0.5786 - see project history.)
-#
-# Bumped a third time to graph_gat_oe_ln_nodefeat_ssl once
-# training/pretrain_graph_selfsupervised.py existed as an optional warm
-# start (see SELF_SUPERVISED_CHECKPOINT_PATH below) - same weight shapes as
-# graph_gat_oe_ln_nodefeat, so this checkpoint WOULD load into either
-# script's model, but a separate directory keeps the with-SSL-warm-start and
-# without-it results directly comparable instead of one overwriting the
-# other. (Result: warm-started run tracked ~0.01 MCC below the non-SSL run
-# at the same epoch, within noise - see project history.)
-#
-# Bumped a fourth time to graph_gat_10kb: GRAPH_RESOLUTION moved 25kb -> 10kb
-# (see config.project_config - the majority-vote-per-node oracle rises from
-# ~0.69 to ~0.77 at 10kb, and every 25kb GATv2 variant tried had converged
-# to the same ~0.55-0.58 MCC band regardless of edge/node-feature/SSL
-# changes, consistent with all of them hitting the 25kb oracle's ceiling
-# rather than an architectural limit). NODE_FEATURE_DIM is unchanged (793 -
-# EXTRA_NODE_FEATURE_DIM doesn't depend on node count), so the OLD 25kb
-# checkpoints in graph_gat_oe_ln_nodefeat[_ssl] would technically still
-# LOAD here without a shape error - but their weights were learned on a
-# completely different graph (121K 25kb nodes vs 303K 10kb nodes, different
-# edges), so reusing them would be a meaningless warm start, not a real
-# resume - a new directory avoids that trap.
+
 CHECKPOINT_SUBDIR = ACTIVE_CHECKPOINT_DIR.parent / "graph_gat_10kb"
 LAST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "last_checkpoint.pt"
 BEST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model.pt"
 STRUCTURE_BRANCH_WEIGHTS_PATH = CHECKPOINT_SUBDIR / "structure_branch_pretrained.pt"
-# Second, purely additive checkpoint pair selected by val_mcc instead of
-# val_loss - see the best_validation_mcc tracking in main(). Fusion scripts
-# keep warm-starting from STRUCTURE_BRANCH_WEIGHTS_PATH above (unchanged);
-# this one exists for whoever wants the actual best-MCC epoch's weights.
+
 BEST_MCC_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model_mcc.pt"
 STRUCTURE_BRANCH_WEIGHTS_MCC_PATH = CHECKPOINT_SUBDIR / "structure_branch_pretrained_mcc.pt"
 
-# Optional warm start, produced by training/pretrain_graph_selfsupervised.py
-# (link prediction on real Hi-C contacts - no methylation labels involved).
-# Only applied on a genuinely fresh run (see main() - LAST_CHECKPOINT_PATH
-# resume always takes priority when both exist, since that checkpoint's
-# weights already reflect this warm start plus however much further
-# methylation-supervised training happened after it). Points at the 10kb
-# self-supervised checkpoint dir (see pretrain_graph_selfsupervised.py's own
-# CHECKPOINT_SUBDIR, bumped the same way and for the same reason as this
-# file's above) - doesn't exist until that script is rerun on the 10kb
-# graph, so this run starts from a random init unless/until it is.
+
 SELF_SUPERVISED_CHECKPOINT_PATH = (
     ACTIVE_CHECKPOINT_DIR.parent / "graph_gat_selfsupervised_10kb" / "structure_branch_selfsupervised.pt"
 )
@@ -214,7 +141,7 @@ class GraphOnlyModel(nn.Module):
         super().__init__()
         self.structure_branch = GATv2Structure()
         self.head = nn.Sequential(
-            nn.Linear(128, head_hidden_dim),
+            nn.Linear(GRAPH_BRANCH_OUTPUT_DIM, head_hidden_dim),
             nn.ReLU(),
             nn.Dropout(head_dropout_prob),
             nn.Linear(head_hidden_dim, 1),
@@ -253,12 +180,6 @@ def collect_validation_probabilities(
 
 
 def sweep_best_threshold(probabilities: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
-    """Scans candidate decision thresholds on already-computed validation
-    probabilities for the one maximizing MCC - the fixed 0.5 default used
-    everywhere else in this project isn't necessarily optimal under the
-    dataset's ~21% positive class rate. A pure lookup over one held-out
-    split (no refitting), so this doesn't introduce new leakage - the same
-    validation split already used for model/checkpoint selection."""
     best_threshold = 0.5
     best_mcc = matthews_corrcoef(labels, (probabilities >= 0.5).astype(np.int8))
     for threshold in np.arange(0.05, 0.951, 0.01):
@@ -298,11 +219,6 @@ def run_epoch(
             node_index = batch["node_index"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
-            # Mixed precision: halves the memory of GATv2Conv's per-edge
-            # attention intermediates (see model/graph_branch_gat.py - this
-            # is what made the full-precision run OOM at ~95GB even after
-            # heads/hidden_dim were already reduced). GradScaler keeps the
-            # backward pass numerically safe under fp16.
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(node_features, edge_index, edge_attr, node_index)
                 loss = criterion(logits, labels)
@@ -382,10 +298,6 @@ def main() -> None:
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {num_params:,}")
 
-    # Self-supervised warm start (training/pretrain_graph_selfsupervised.py's
-    # link-prediction pretraining) - only on a genuinely fresh run, since a
-    # LAST_CHECKPOINT_PATH resume below already contains this warm start
-    # plus whatever methylation-supervised training happened after it.
     if SELF_SUPERVISED_CHECKPOINT_PATH.exists() and not LAST_CHECKPOINT_PATH.exists():
         structure_state_dict = torch.load(SELF_SUPERVISED_CHECKPOINT_PATH, map_location=device, weights_only=False)
         model.structure_branch.load_state_dict(structure_state_dict)
@@ -394,22 +306,12 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler(device="cuda")
-    # Same scheduler settings train.py already uses - the first run's
-    # val_loss plateaued/oscillated with no clear trend past ~epoch 14,
-    # which is the signal a LR drop is meant to respond to.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=LR_SCHEDULER_FACTOR, patience=LR_SCHEDULER_PATIENCE, min_lr=LR_SCHEDULER_MIN_LR,
     )
 
     start_epoch = 0
     best_validation_loss = float("inf")
-    # Tracked alongside best_validation_loss, not instead of it: the two
-    # don't always pick the same epoch (a prior run's val_loss-best epoch
-    # wasn't its val_mcc-best epoch), so both checkpoints are kept - the
-    # val_loss one stays what fusion scripts warm-start structure_branch
-    # from (unchanged path/behavior), the val_mcc one is a second, purely
-    # additive save for whoever wants the epoch that was actually best by
-    # the metric this branch is judged on.
     best_validation_mcc = -float("inf")
     patience_counter = 0
     history = []
@@ -431,10 +333,6 @@ def main() -> None:
         if "best_validation_mcc" in checkpoint:
             best_validation_mcc = checkpoint["best_validation_mcc"]
         elif history:
-            # Backward-compat: resuming from a last_checkpoint.pt saved
-            # before this dual-checkpoint change existed - reconstruct the
-            # running best-MCC from the stored per-epoch history instead of
-            # restarting it from -inf.
             best_validation_mcc = max(entry["validation"]["mcc"] for entry in history)
             print(f"  (older checkpoint format: reconstructed best_validation_mcc={best_validation_mcc:.4f} from history)")
 
@@ -455,10 +353,6 @@ def main() -> None:
 
         scheduler.step(validation_metrics["loss"])
         current_lr = optimizer.param_groups[0]["lr"]
-
-        # Early stopping/patience still keyed on val_loss only, unchanged -
-        # the parallel val_mcc-best tracking below is purely additive and
-        # never affects when training stops.
         improved = validation_metrics["loss"] < best_validation_loss - EARLY_STOPPING_MIN_DELTA
         mcc_improved = validation_metrics["mcc"] > best_validation_mcc + EARLY_STOPPING_MIN_DELTA
         print(

@@ -1,21 +1,3 @@
-"""
-Sequence-code extraction for data_gm12878/proceed/disjoint_split/{split}.parquet,
-for a quick sequence-only sanity check on GM12878 (training/train_sequence_gm12878.py)
-before investing in the full Hi-C graph + DNABERT-2 setup. Independent of
-physicochemical/graph data entirely - same reasoning as
-feature_extraction/extract_sequence_codes_v5.py (no shard-alignment
-requirement to satisfy since this doesn't feed training/dataset.py's
-DeepMethShardDataset).
-
-Reuses encode_sequences_to_base_codes from
-feature_extraction/extract_sequence_codes.py (pure function, no shared
-state) rather than redefining the encoding logic.
-
-Usage (no arguments needed, after preprocess_gm12878.py):
-
-    python feature_extraction/extract_sequence_codes_gm12878.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -28,8 +10,8 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from config.project_config import BASE_ORDER, SEQUENCE_LENGTH, UNKNOWN_BASE_CODE
+from config.data_config.gm12878_config import GM12878_DATA_DIR
 from feature_extraction.extract_sequence_codes import encode_sequences_to_base_codes
-from preprocessing.download_data_gm12878 import GM12878_DATA_DIR
 
 DATASET_DIR_GM12878 = GM12878_DATA_DIR / "proceed" / "disjoint_split"
 SEQUENCE_CODES_DIR_GM12878 = GM12878_DATA_DIR / "sequence_codes"

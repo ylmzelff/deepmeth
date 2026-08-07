@@ -1,6 +1,6 @@
 """
-Build the 100kb-resolution Hi-C graph for the HepG2 GRCh38 genome:
-  1. a node index (one row per 100kb bin, chr1-22 + chrX)
+Build the GRAPH_RESOLUTION-bp Hi-C graph for the HepG2 GRCh38 genome:
+  1. a node index (one row per GRAPH_RESOLUTION-bp bin, chr1-22 + chrX)
   2. a 4-feature O/E edge representation for GATv2Structure's attention
      (see model/graph_branch_gat.py and compute_oe_edge_features below),
      intra-chromosomal contacts only (inter-chromosomal set to 0 - keeps
@@ -8,7 +8,7 @@ Build the 100kb-resolution Hi-C graph for the HepG2 GRCh38 genome:
      3D-genome-informed model)
 
 Requires `pip install hic-straw` and the raw .hic file from
-preprocessing/download_data.py.
+preprocessing/download_data_hepg2.py.
 
 Usage (no arguments needed):
 
@@ -27,13 +27,12 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from config.data_config.hepg2_config import GENOME_ASSEMBLY, HIC_RAW_FILE_PATH
 from config.project_config import (
-    GENOME_ASSEMBLY,
     GRAPH_DIR,
     GRAPH_RESOLUTION,
     HIC_MAX_CONTACT_DISTANCE_BP,
     HIC_NORMALIZATION_TYPE,
-    HIC_RAW_FILE_PATH,
     HIC_TOP_K_NEIGHBORS,
     INCLUDED_CHROMOSOMES,
 )
@@ -55,7 +54,7 @@ def normalize_chromosome_name(name: str) -> str:
 
 
 def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile", dict[str, str]]:
-    """One row per 100kb bin across chr1-22 + chrX, in a fixed global order.
+    """One row per GRAPH_RESOLUTION-bp bin across chr1-22 + chrX, in a fixed global order.
 
     Also returns a {normalized_name: raw_name} map, since .hic files vary in
     whether they store chromosomes as "chr1" or "1" - matrixZoomData lookups
@@ -364,7 +363,7 @@ def compute_oe_edge_features(adjacency: sp.coo_matrix, resolution: int) -> tuple
 
 def main() -> None:
     print("=" * 70)
-    print("Building the HepG2 100kb Hi-C graph (GRCh38)")
+    print(f"Building the HepG2 {GRAPH_RESOLUTION:,}bp Hi-C graph (GRCh38)")
     print("=" * 70)
     print(f"Assembly: {GENOME_ASSEMBLY}")
     print(f"Source: {HIC_RAW_FILE_PATH}")

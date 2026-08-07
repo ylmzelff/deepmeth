@@ -1,51 +1,3 @@
-"""
-Create DNABERT-2 node features for the GM12878/hg19 Hi-C graph - the
-architecture-validation counterpart to feature_extraction/extract_dnabert2.py
-(HepG2/GRCh38).
-
-REDESIGNED after checking real coverage: an earlier version sourced
-candidate CpGs only from disjoint_split's RRBS-observed CpGs (629,196
-total). RRBS (MspI digestion, CpG-island-enriched) only assays a
-genomically biased subset of CpGs, and that left ~45% of the 30,376 graph
-nodes with zero real DNABERT coverage (all-zero feature vectors) - unlike
-HepG2/WGBS, where coverage is close to genome-wide and only sparse
-assembly gaps go uncovered. A node feature is meant to represent a
-genomic REGION's sequence content for the graph branch's 3D-context
-signal; it doesn't need to be restricted to CpGs this specific
-methylation assay happened to observe.
-
-This version instead scans the hg19 REFERENCE GENOME itself (hg19.2bit,
-via preprocessing/preprocess.py's extract_cpg_centered_sequence) for every
-CG dinucleotide inside each node's 100kb window, regardless of RRBS
-coverage. Real DNA sequence is present at virtually every node this way;
-only true assembly gaps (long N-runs) contain zero CG occurrences and
-stay uncovered - the same caveat HepG2 already had, not a new one.
-
-Deterministically caps each node at GM12878_MAX_CPG_PER_NODE, evenly spaced
-across that node's genome-wide CG positions. Raised from an initial 64
-(HepG2's own constant, DNABERT_MAX_CPG_PER_NODE) to 128 as a local override
-after the sequence/graph/physicochemical branch checks were already
-running well: the 64-cap run embedded 1.83M sequences in 9.3 min (~4,150
-rows/s observed) - well under HepG2's own workload - so there's cheap
-headroom to average each node's embedding over roughly twice as many CG
-windows, giving a less noisy per-node representation without changing the
-graph's node COUNT or resolution (that part stays exactly as validated).
-Expect roughly ~2x the embedded-CpG total and runtime (~15-20 min) versus
-the cap=64 run.
-
-Reuses load_frozen_model/masked_mean_pooling/embed_and_pool_nodes from
-extract_dnabert2.py and extract_cpg_centered_sequence from
-preprocessing/preprocess.py unchanged (both genome-agnostic: operate on
-whatever TwoBitFile/dataframe they're given).
-
-Requires prepare_hic_graph_gm12878.py's node_index.parquet (defines which
-100kb bins exist) and download_data_gm12878.py's hg19.2bit reference.
-
-Usage (no arguments needed, after prepare_hic_graph_gm12878.py):
-
-    python feature_extraction/extract_dnabert2_gm12878.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -71,13 +23,11 @@ from config.project_config import (
     MAX_UNKNOWN_FRACTION,
     SEQUENCE_LENGTH,
 )
+from config.data_config.gm12878_config import GM12878_DATA_DIR, HG19_2BIT_PATH
 from feature_extraction.extract_dnabert2 import embed_and_pool_nodes, load_frozen_model
-from preprocessing.download_data_gm12878 import GM12878_DATA_DIR, HG19_2BIT_PATH
-from preprocessing.preprocess import extract_cpg_centered_sequence
+from preprocessing.preprocess_hepg2 import extract_cpg_centered_sequence
 
-# Local override, NOT read from config.project_config's DNABERT_MAX_CPG_PER_NODE
-# (=64, HepG2's own budget-driven cap) - see module docstring for why 128 is
-# affordable here.
+
 GM12878_MAX_CPG_PER_NODE = 128
 
 GM12878_GRAPH_DIR = GM12878_DATA_DIR / "graph"
@@ -103,10 +53,7 @@ def find_genome_cpg_positions(genome: TwoBitFile, chrom: str) -> np.ndarray:
 
 
 def select_genome_cpgs_per_node(positions: np.ndarray, bin_starts: np.ndarray) -> pd.DataFrame:
-    """Deterministic, evenly-spaced selection of up to GM12878_MAX_CPG_PER_NODE
-    positions per 100kb node - mirrors extract_dnabert2.py's
-    select_cpgs_per_node, but candidates are every CG in the reference
-    genome for that node's window, not just RRBS-observed CpGs."""
+  
     order = np.argsort(bin_starts, kind="stable")
     positions = positions[order]
     bin_starts = bin_starts[order]
@@ -269,7 +216,7 @@ def main() -> None:
         "model_name": DNABERT_MODEL_NAME,
         "model_revision": DNABERT_MODEL_REVISION,
         "frozen": True,
-        "pooling": "masked_mean_per_sequence_then_mean_per_100kb_node",
+        "pooling": "masked_mean_per_sequence_then_mean_per_node",
         "source": "hg19 reference genome CG dinucleotide scan (NOT RRBS-observed CpGs)",
         "graph_resolution": GRAPH_RESOLUTION,
         "max_cpg_per_node": GM12878_MAX_CPG_PER_NODE,

@@ -3,23 +3,21 @@ Download the raw ENCODE HepG2 WGBS methylation replicates, the HepG2 Hi-C
 contact matrix, and the GRCh38 reference genome that the rest of the
 pipeline consumes.
 
-Every accession/path lives in config.project_config, so this runs with no
-arguments:
-
-    python preprocessing/download_data.py
+Every accession/path lives in config.data_config.hepg2_config.
 """
 
 from __future__ import annotations
 
 import hashlib
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import requests
 
-from config.project_config import (
+from config.data_config.hepg2_config import (
     GENOME_ASSEMBLY,
     GRCH38_2BIT_PATH,
     GRCH38_2BIT_URL,
@@ -33,7 +31,8 @@ ENCODE_API_ROOT = "https://www.encodeproject.org"
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 PROGRESS_INTERVAL_BYTES = CHUNK_SIZE * 200  # print every ~200 MB
 
-EXPECTED_WGBS_OUTPUT_TYPE = "methylation state at CpG"
+
+EXPECTED_METHYLATION_OUTPUT_TYPE = "methylation state at CpG"
 EXPECTED_HIC_OUTPUT_TYPE = "mapping quality thresholded contact matrix"
 
 
@@ -109,15 +108,16 @@ def download_encode_file(
     accession: str,
     destination: Path,
     expected_output_type: str,
+    expected_assembly: str,
 ) -> None:
     """Download one ENCODE file after validating its assembly, output type and status."""
     metadata = fetch_encode_file_metadata(accession)
 
     assembly = metadata.get("assembly")
 
-    if assembly != GENOME_ASSEMBLY:
+    if assembly != expected_assembly:
         raise RuntimeError(
-            f"{accession}: expected assembly {GENOME_ASSEMBLY}, found {assembly!r}. "
+            f"{accession}: expected assembly {expected_assembly}, found {assembly!r}. "
             "Refusing to download a mismatched genome build."
         )
 
@@ -156,9 +156,15 @@ def download_reference_genome() -> None:
     )
 
 
+def print_downloaded_sizes(paths: Iterable[Path]) -> None:
+    for path in paths:
+        size_gb = path.stat().st_size / 1024 ** 3
+        print(f"  {path}  ({size_gb:.2f} GB)")
+
+
 def main() -> None:
     print("=" * 70)
-    print(f"DeepMeth data download (HepG2, GRCh38)")
+    print("DeepMeth data download (HepG2, GRCh38)")
     print("=" * 70)
 
     print(f"\n[1/3] HepG2 WGBS methylation replicates {WGBS_REPLICATE_ACCESSIONS}")
@@ -167,7 +173,8 @@ def main() -> None:
         download_encode_file(
             accession=accession,
             destination=destination,
-            expected_output_type=EXPECTED_WGBS_OUTPUT_TYPE,
+            expected_output_type=EXPECTED_METHYLATION_OUTPUT_TYPE,
+            expected_assembly=GENOME_ASSEMBLY,
         )
 
     print(f"\n[2/3] HepG2 Hi-C contact matrix ({HIC_FILE_ACCESSION})")
@@ -176,6 +183,7 @@ def main() -> None:
         accession=HIC_FILE_ACCESSION,
         destination=HIC_RAW_FILE_PATH,
         expected_output_type=EXPECTED_HIC_OUTPUT_TYPE,
+        expected_assembly=GENOME_ASSEMBLY,
     )
 
     print("\n[3/3] GRCh38 reference genome (UCSC hg38.2bit)")
@@ -184,9 +192,7 @@ def main() -> None:
 
     print("\nAll downloads completed.")
 
-    for path in (*WGBS_REPLICATE_PATHS, HIC_RAW_FILE_PATH, GRCH38_2BIT_PATH):
-        size_gb = path.stat().st_size / 1024 ** 3
-        print(f"  {path}  ({size_gb:.2f} GB)")
+    print_downloaded_sizes((*WGBS_REPLICATE_PATHS, HIC_RAW_FILE_PATH, GRCH38_2BIT_PATH))
 
 
 if __name__ == "__main__":

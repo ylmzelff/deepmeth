@@ -1,49 +1,3 @@
-"""
-Train the three-branch DeepMeth model (sequence + Hi-C graph + physicochemical).
-
-Dataset-agnostic entry point: everything (paths, hyperparameters, whether
-to warm-start from standalone-branch checkpoints) comes from
-config.project_config's ACTIVE_* constants, which resolve off that
-module's single DATASET switch ("HEPG2" or "GM12878"). To train the other
-dataset, change that one line - nothing here needs to change.
-
-Two training modes, selected by ACTIVE_WARM_START:
-  - False (HepG2's original path): plain single-phase training, the whole
-    model trainable from epoch 0, at ACTIVE_LEARNING_RATE.
-  - True (GM12878's path, since standalone sequence/graph/physicochemical
-    checkpoints exist for it): the three branches are loaded from those
-    checkpoints and frozen for ACTIVE_WARMUP_FROZEN_EPOCHS epochs (only
-    the fusion head trains, at ACTIVE_FROZEN_LEARNING_RATE), then
-    unfrozen and fine-tuned jointly at ACTIVE_UNFREEZE_LEARNING_RATE.
-    Empirically this beat from-scratch training on GM12878 (val_mcc
-    0.66 vs 0.60) - see project history.
-
-The graph branch runs GATv2Structure (see model/graph_branch_gat.py) over
-the *entire* static Hi-C graph on every batch (full-graph message passing,
-then a row-select pulls the batch's nodes out of the result, followed by
-CpGAwareGraphReadout conditioning that on each sample's own sequence
-embedding - see model/graph_readout.py) - so node_features.npy and
-edge_features.npz are loaded once and kept resident on the device for the
-whole run, not re-loaded per batch.
-
-HepG2 note: this GATv2-based graph branch needs edge_features.npz (O/E Hi-C
-edge features), which only feature_extraction/prepare_hic_graph_gm12878.py
-currently computes - HepG2's own prepare_hic_graph.py never gained that
-step, so this script's HepG2 path is broken until/unless that's added.
-GM12878 is this project's active focus (see project history); fixing HepG2
-was deliberately deferred rather than done here.
-
-Resumable: if last_checkpoint.pt exists (under ACTIVE_CHECKPOINT_DIR),
-training resumes from there (model/optimizer/scheduler state, epoch, best
-validation loss, early-stopping counter, and - in warm-start mode - which
-phase it was in) instead of starting over - Colab sessions can disconnect
-mid-run.
-
-Usage (no arguments needed - set DATASET in config/project_config.py):
-
-    python training/train.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -97,7 +51,6 @@ from config.project_config import (
     PHYSCHEM_DROPOUT,
     POS_WEIGHT_MODE,
     TRAINING_SEED,
-    USE_SEQUENCE_SELF_ATTENTION,
 )
 from model.deepmeth_model import DeepMethModel
 from model.graph_branch_gat import load_oe_edge_index
@@ -172,10 +125,6 @@ def load_branch_weights(submodule: nn.Module, checkpoint_path: Path, prefix: str
         raise FileNotFoundError(
             f"{checkpoint_path} does not exist. Run the matching standalone branch training script first."
         )
-
-    # weights_only=False: safe here (self-generated, trusted checkpoint) and
-    # required on PyTorch 2.6+, whose new weights_only=True default rejects
-    # the numpy scalar types (from sklearn metrics) these checkpoints contain.
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     full_state_dict = checkpoint["model_state_dict"]
 
@@ -190,14 +139,9 @@ def load_branch_weights(submodule: nn.Module, checkpoint_path: Path, prefix: str
 
 
 def load_structure_branch_weights(module: nn.Module, checkpoint_path: Path, device: torch.device) -> None:
-    """training/train_graph_gat.py saves GATv2Structure's weights directly
-    (torch.save(model.structure_branch.state_dict(), ...) - no wrapping
-    "model_state_dict" dict, no "structure_branch." key prefix, unlike the
-    sequence/physchem standalone checkpoints load_branch_weights above
-    handles), so it needs its own, simpler loader instead of that one."""
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"{checkpoint_path} does not exist. Run training/train_graph_gat.py first."
+            f"{checkpoint_path} does not exist. Run training/branch_pretrain/train_graph_gat.py first."
         )
     state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
     module.load_state_dict(state_dict, strict=True)
@@ -211,16 +155,8 @@ def set_branch_trainable(model: DeepMethModel, trainable: bool) -> None:
 
 
 def build_optimizer_and_scheduler(model: DeepMethModel, learning_rate: float):
-    # AdamW instead of Adam: Adam's weight_decay is coupled with its
-    # adaptive per-parameter learning rate (the penalty gets scaled by the
-    # same factor as the gradient), which makes the decay weaker/less
-    # predictable than plain L2 - AdamW (Loshchilov & Hutter, 2017) decouples
-    # it, applying weight decay directly to the weights instead.
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable_parameters, lr=learning_rate, weight_decay=ACTIVE_WEIGHT_DECAY)
-    # Halves LR when val_loss hasn't improved for LR_SCHEDULER_PATIENCE
-    # epochs, instead of training at a fixed LR regardless of where the loss
-    # curve actually is.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=LR_SCHEDULER_FACTOR, patience=LR_SCHEDULER_PATIENCE, min_lr=LR_SCHEDULER_MIN_LR,
     )
@@ -267,20 +203,12 @@ def run_epoch(
                 physchem_input=physchem_input,
             ).squeeze(1)
 
-            # This is what gets logged/compared across epochs and runs -
-            # kept free of the L1 penalty term below so metrics stay
-            # comparable regardless of ACTIVE_L1_LAMBDA.
             prediction_loss = criterion(logits, labels)
 
             if is_training:
                 training_loss = prediction_loss
 
                 if ACTIVE_L1_LAMBDA > 0:
-                    # ncVarPred's own training code applies L1 specifically
-                    # to the fusion (FC) and graph structure layers, not the
-                    # conv/BiLSTM/physicochemical branches - matched here
-                    # (structure_branch is GATv2Structure now, not the
-                    # original GCN, but the same scope applies).
                     l1_penalty = sum(
                         parameter.abs().sum()
                         for module in (model.fusion, model.structure_branch)
@@ -290,9 +218,6 @@ def run_epoch(
 
                 optimizer.zero_grad()
                 training_loss.backward()
-                # Caps the rare large-gradient batch (BiLSTM/GATv2 stacks can
-                # produce one) from knocking the model out of a good region
-                # in a single step; a no-op on normal small-gradient steps.
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
                 optimizer.step()
 
@@ -361,13 +286,12 @@ def main() -> None:
 
     pos_weight = resolve_pos_weight(train_dataset)
 
-    print(f"\n[3/5] Building model (use_sequence_self_attention={USE_SEQUENCE_SELF_ATTENTION})")
+    print("\n[3/5] Building model")
     model = DeepMethModel(
         physchem_dropout_prob=PHYSCHEM_DROPOUT,
         fusion_projected_dim=FUSION_PROJECTED_DIM,
         fusion_hidden_dim=FUSION_HIDDEN_DIM,
         fusion_dropout_prob=FUSION_DROPOUT,
-        use_sequence_self_attention=USE_SEQUENCE_SELF_ATTENTION,
     ).to(device)
 
     if ACTIVE_WARM_START:
@@ -385,10 +309,6 @@ def main() -> None:
     patience_counter = 0
     history = []
 
-    # With ACTIVE_WARM_START=False, ACTIVE_WARMUP_FROZEN_EPOCHS=0 so this
-    # phase is skipped immediately (epoch 0 >= 0) - the whole model trains
-    # from the first epoch, reproducing the pre-unification HepG2 path
-    # exactly.
     is_frozen_phase = ACTIVE_WARM_START and ACTIVE_WARMUP_FROZEN_EPOCHS > 0
     if is_frozen_phase:
         set_branch_trainable(model, trainable=False)
@@ -439,9 +359,6 @@ def main() -> None:
 
         epoch_duration = time.time() - epoch_start
 
-        # Step the scheduler on validation loss before logging, so the
-        # printed lr already reflects any drop triggered by this epoch's
-        # result.
         scheduler.step(validation_metrics["loss"])
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -496,11 +413,6 @@ def main() -> None:
         with HISTORY_PATH.open("w", encoding="utf-8") as file:
             json.dump(history, file, indent=2)
 
-        # Patience only counts once we're past any frozen warm-start phase -
-        # during that phase the model hasn't started real joint fine-tuning
-        # yet, so an early-stop check there would be premature. With
-        # ACTIVE_WARM_START=False, is_frozen_phase is always False, so this
-        # is unconditional early stopping, same as the original HepG2 loop.
         if not is_frozen_phase and patience_counter >= ACTIVE_EARLY_STOPPING_PATIENCE:
             print(f"\nEarly stopping: no improvement for {ACTIVE_EARLY_STOPPING_PATIENCE} epochs.")
             break

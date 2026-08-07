@@ -1,27 +1,3 @@
-"""
-Combine the GM12878 Hi-C node index with the DNABERT-2 node features into
-node_features.npy, and map every CpG in disjoint_split to its graph node -
-the GM12878/hg19 counterpart to feature_extraction/prepare_graph_features.py
-(HepG2/GRCh38).
-
-(An earlier version also mapped a second, DeepMethyl-comparable
-baseline_split - see preprocessing/preprocess_gm12878.py's docstring for
-why that split was removed; disjoint_split is the only one any GM12878
-experiment in this project actually uses.)
-
-load_dnabert_node_features/build_node_features/compute_node_index_for_split
-are local adaptations of prepare_graph_features.py's versions (same logic),
-since the originals hardcode HepG2's DNABERT_NODE_FEATURES_DIR/DATASET_DIR
-paths.
-
-Requires prepare_hic_graph_gm12878.py and extract_dnabert2_gm12878.py to
-have run first.
-
-Usage (no arguments needed):
-
-    python feature_extraction/prepare_graph_features_gm12878.py
-"""
-
 from __future__ import annotations
 
 import sys
@@ -32,16 +8,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pandas as pd
 
+from config.data_config.gm12878_config import GM12878_DATA_DIR
 from config.project_config import DNABERT_HIDDEN_SIZE, GRAPH_RESOLUTION, INCLUDED_CHROMOSOMES
-from preprocessing.download_data_gm12878 import GM12878_DATA_DIR
 
 GM12878_GRAPH_DIR = GM12878_DATA_DIR / "graph"
 NODE_INDEX_PATH = GM12878_GRAPH_DIR / "node_index.parquet"
 NODE_FEATURES_OUTPUT_PATH = GM12878_GRAPH_DIR / "node_features.npy"
 
-# Must match model/graph_branch_gat.py's own EXTRA_NODE_FEATURE_DIM
-# (independently derived from the same INCLUDED_CHROMOSOMES constant, not
-# imported directly, to avoid a model/ -> feature_extraction/ dependency).
 CHROMOSOME_TO_INDEX = {chrom: index for index, chrom in enumerate(INCLUDED_CHROMOSOMES)}
 EXTRA_NODE_FEATURE_DIM = len(INCLUDED_CHROMOSOMES) + 2
 
@@ -137,28 +110,7 @@ def build_node_features(
 
 
 def build_extra_node_features(node_index: pd.DataFrame, dnabert_index: pd.DataFrame) -> np.ndarray:
-    """
-    3 kinds of cheap, leak-free feature appended after the raw 768-d
-    DNABERT-2 node embedding - none use methylation labels or any real
-    epigenomic measurement, only genomic coordinates and the DNABERT
-    extraction's own bookkeeping:
-
-      - chromosome one-hot (len(INCLUDED_CHROMOSOMES) dims): GATv2Structure
-        previously had no notion of which chromosome a node is on at all.
-      - normalized position within chromosome (1 dim: bin_start / that
-        chromosome's own max bin_end): previously no way to distinguish a
-        telomere-proximal node from a centromere-proximal one.
-      - normalized sample_count (1 dim): how many CG windows were actually
-        averaged into this node's 768-d embedding (capped at
-        GM12878_MAX_CPG_PER_NODE=128 in extract_dnabert2_gm12878.py) -
-        this was already computed there but silently discarded when
-        node_features.npy was first built (see project history). Lets the
-        model distinguish a well-supported embedding (many CGs averaged,
-        e.g. a CG-dense promoter/CpG-island region) from a noisy one (few
-        CGs, e.g. mostly repeat/gap sequence) instead of treating both
-        identically. Normalized by this dataset's own observed max
-        (not hardcoding 128), so it stays correct if that cap ever changes.
-    """
+    
     number_of_nodes = len(node_index)
 
     chromosome_indices = node_index["chrom"].map(CHROMOSOME_TO_INDEX).to_numpy()

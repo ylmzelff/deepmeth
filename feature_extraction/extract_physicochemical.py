@@ -1,24 +1,3 @@
-"""
-Extract a compact per-CpG dinucleotide-code array for every CpG in
-train/validation/test.parquet - the cached, reusable raw material for the
-physicochemical CNN branch.
-
-Each 501bp sequence is stored as 500 uint8 codes (one of the 16 ACGT
-dinucleotides, or a sentinel for anything involving "N"), not the full
-[12, 500] float32 matrix. The dense matrix is trivial and fast to
-reconstruct from these codes at training time (see expand_codes_to_matrix
-below) - storing the dense matrix directly would be ~18x more disk and,
-because it's mostly redundant (only 16 distinct dinucleotides exist),
-~10x slower to write due to compression overhead on that much redundant
-floating-point data. The codes are cached once and reused by every future
-training run, same as the dense matrix would have been - only the storage
-format changed, not the extract-once-reuse-forever design.
-
-Usage (no arguments needed):
-
-    python feature_extraction/extract_physicochemical.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -48,13 +27,7 @@ EXPECTED_DINUCLEOTIDES = {f"{first}{second}" for first in "ACGT" for second in "
 
 
 def load_physicochemical_properties_di(file_path: str | Path) -> dict[str, np.ndarray]:
-    """
-    Load the normalized dinucleotide physicochemical property table.
-
-    Expected Excel structure: column A = dinucleotide, columns B-M = 12
-    physicochemical properties. Returns a dict mapping each dinucleotide to
-    a float32 vector of 12 properties.
-    """
+  
     file_path = Path(file_path)
 
     if not file_path.exists():
@@ -100,16 +73,13 @@ def dinucleotide_codes(property_table: Mapping[str, Sequence[float]]) -> list[st
 
 
 def build_property_matrix_by_code(property_table: Mapping[str, Sequence[float]]) -> np.ndarray:
-    """(16, 12) float32: row i is the property vector for dinucleotide_codes()[i]."""
+  
     codes = dinucleotide_codes(property_table)
     return np.stack([np.asarray(property_table[d], dtype=np.float32) for d in codes])
 
 
 def _build_code_lookup(property_table: Mapping[str, Sequence[float]]) -> np.ndarray:
-    """(128, 128) uint8 ASCII-indexed lookup: dinucleotide -> its 0-15 code,
-    UNKNOWN_DINUCLEOTIDE_CODE for anything else (only "N"-containing pairs
-    are expected to hit this, by construction of preprocess.py's sequence QC).
-    """
+   
     lookup_table = np.full((128, 128), UNKNOWN_DINUCLEOTIDE_CODE, dtype=np.uint8)
 
     for code, dinucleotide in enumerate(dinucleotide_codes(property_table)):
@@ -122,10 +92,7 @@ def _build_code_lookup(property_table: Mapping[str, Sequence[float]]) -> np.ndar
 def _build_dinucleotide_lookup(
     property_table: Mapping[str, Sequence[float]],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build a (128, 128, 12) ASCII-indexed lookup table plus a (128, 128)
-    "known dinucleotide" mask, so the conversion below is a couple of
-    vectorized numpy calls instead of a per-position Python loop.
-    """
+   
     lookup_table = np.zeros((128, 128, 12), dtype=np.float32)
     known_mask = np.zeros((128, 128), dtype=bool)
 
@@ -143,23 +110,7 @@ def convertSampleToPhyChemVector_Di(
     expected_length: int = SEQUENCE_LENGTH,
     unknown_strategy: str = "zero",
 ) -> np.ndarray:
-    """
-    Convert DNA sequences into dinucleotide physicochemical matrices.
-
-    Follows the original Yeast Promoter implementation: every adjacent
-    dinucleotide is represented using 12 physicochemical properties.
-
-    Returns an array shaped [number_of_samples, 12, expected_length - 1]
-    (i.e. [N, 12, 500] for 501bp sequences).
-
-    unknown_strategy controls how dinucleotides containing "N" are handled:
-    "zero" leaves them as the zero vector, "error" raises instead.
-
-    Vectorized over numpy (ASCII-code lookup table) rather than a
-    per-position Python loop - verified to produce bit-identical output to
-    the naive loop, ~19x faster at this dataset's scale (tens of millions
-    of CpGs).
-    """
+   
     if len(sampleSeq) == 0:
         raise ValueError("sampleSeq must contain at least one DNA sequence.")
 
@@ -208,11 +159,7 @@ def encode_sequences_to_codes(
     property_table: Mapping[str, Sequence[float]],
     expected_length: int = SEQUENCE_LENGTH,
 ) -> np.ndarray:
-    """Compact form of convertSampleToPhyChemVector_Di: one uint8 dinucleotide
-    code per position instead of the full 12-dim property vector.
-
-    Returns shape [number_of_samples, expected_length - 1].
-    """
+   
     sequences = [str(sequence).strip().upper() for sequence in sequences]
 
     joined_sequences = "".join(sequences).encode("ascii")
@@ -227,10 +174,7 @@ def expand_codes_to_matrix(
     codes: np.ndarray,
     property_table: Mapping[str, Sequence[float]],
 ) -> np.ndarray:
-    """Reconstruct the [N, 12, L-1] physicochemical matrix from compact
-    dinucleotide codes (output of encode_sequences_to_codes). Verified to
-    exactly match convertSampleToPhyChemVector_Di's dense output.
-    """
+    
     property_matrix_by_code = build_property_matrix_by_code(property_table)
     # Row UNKNOWN_DINUCLEOTIDE_CODE -> append a zero row so it maps cleanly.
     lookup_with_zero_row = np.vstack([property_matrix_by_code, np.zeros((1, 12), dtype=np.float32)])
@@ -335,7 +279,7 @@ def main() -> None:
 
         if not parquet_path.exists():
             raise FileNotFoundError(
-                f"{parquet_path} does not exist. Run preprocessing/preprocess.py first."
+                f"{parquet_path} does not exist. Run preprocessing/preprocess_hepg2.py first."
             )
 
         print(f"\nProcessing split: {split_name}")

@@ -1,16 +1,3 @@
-"""
-Combine the Hi-C node index with the DNABERT-2 node features into the final
-node_features.npy (one row per graph node, matching node_index.parquet's
-node ordering), and map every CpG in train/validation/test to its graph node
-(needed at training time to select which node's row applies to each sample).
-
-Requires prepare_hic_graph.py and extract_dnabert2.py to have run first.
-
-Usage (no arguments needed):
-
-    python feature_extraction/prepare_graph_features.py
-"""
-
 from __future__ import annotations
 
 import sys
@@ -44,7 +31,7 @@ def load_node_index() -> pd.DataFrame:
 
 
 def load_dnabert_node_features() -> tuple[pd.DataFrame, np.ndarray]:
-    """Concatenate every chromosome's DNABERT node-feature file into one flat table + embedding array."""
+    
     chrom_chunks, bin_start_chunks, sample_count_chunks, embedding_chunks = [], [], [], []
 
     for chrom in INCLUDED_CHROMOSOMES:
@@ -121,7 +108,7 @@ def compute_node_index_for_split(split_name: str, node_index: pd.DataFrame) -> N
     dataset_path = DATASET_DIR / f"{split_name}.parquet"
 
     if not dataset_path.exists():
-        raise FileNotFoundError(f"{dataset_path} does not exist. Run preprocessing/preprocess.py first.")
+        raise FileNotFoundError(f"{dataset_path} does not exist. Run preprocessing/preprocess_hepg2.py first.")
 
     dataframe = pd.read_parquet(dataset_path, columns=["chrom", "canonical_position"])
 

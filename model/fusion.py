@@ -3,30 +3,6 @@ import torch.nn as nn
 
 
 class GatedFusion(nn.Module):
-    """
-    Gated fusion head, replacing plain concatenation + one linear layer.
-
-    Each branch's output is projected to a shared dimension (tanh), and a
-    per-feature gate over the 3 modalities (softmax-normalized, so the
-    three gates for a given feature sum to 1) is computed from the raw
-    concatenated branch outputs. The gated projections are summed and
-    passed through a small MLP head.
-
-    This lets the model learn, per feature, how much to weight each
-    modality instead of always trusting a fixed linear combination of
-    all 1533 raw dimensions - standard practice for fusing branches of
-    very different dimensionality and character (one-hot sequence,
-    graph embedding, physicochemical CNN features).
-
-    Input:
-        seq_output:       [B, sequence_dim]
-        structure_output: [B, graph_dim]
-        physchem_output:  [B, physchem_dim]
-
-    Output:
-        Raw logit [B, 1].
-    """
-
     def __init__(
         self,
         sequence_dim: int,
@@ -43,8 +19,6 @@ class GatedFusion(nn.Module):
         self.sequence_projection = nn.Linear(sequence_dim, projected_dim)
         self.graph_projection = nn.Linear(graph_dim, projected_dim)
         self.physchem_projection = nn.Linear(physchem_dim, projected_dim)
-
-        # Per-feature gate logits for all 3 modalities at once: [B, 3 * projected_dim] -> [B, 3, projected_dim].
         self.gate_network = nn.Linear(
             sequence_dim + graph_dim + physchem_dim,
             3 * projected_dim,

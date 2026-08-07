@@ -1,23 +1,3 @@
-"""
-Build the 100kb-resolution Hi-C graph for GM12878/hg19 - the
-architecture-validation counterpart to feature_extraction/prepare_hic_graph.py
-(HepG2/GRCh38). Same graph construction (node index + normalized adjacency),
-different genome build and raw .hic file.
-
-Reuses build_raw_adjacency/compute_oe_edge_features/normalize_chromosome_name
-from prepare_hic_graph.py unchanged (genome-agnostic: they take the .hic
-file handle and node index as arguments, no hardcoded HepG2/GRCh38 path
-inside). Only build_node_index is redefined locally, since the original
-hardcodes HIC_RAW_FILE_PATH (HepG2's GRCh38 .hic) - here it points at
-GM12878_HIC_RAW_FILE_PATH (hg19) instead.
-
-Requires `pip install hic-straw` and download_data_gm12878.py to have run.
-
-Usage (no arguments needed):
-
-    python feature_extraction/prepare_hic_graph_gm12878.py
-"""
-
 from __future__ import annotations
 
 import sys
@@ -30,8 +10,8 @@ import numpy as np
 import pandas as pd
 
 from config.project_config import GRAPH_RESOLUTION, INCLUDED_CHROMOSOMES
+from config.data_config.gm12878_config import GM12878_DATA_DIR, GM12878_HIC_RAW_FILE_PATH
 from feature_extraction.prepare_hic_graph import build_raw_adjacency, compute_oe_edge_features
-from preprocessing.download_data_gm12878 import GM12878_DATA_DIR, GM12878_HIC_RAW_FILE_PATH
 
 GM12878_GRAPH_DIR = GM12878_DATA_DIR / "graph"
 NODE_INDEX_PATH = GM12878_GRAPH_DIR / "node_index.parquet"
@@ -41,10 +21,7 @@ EDGE_FEATURES_PATH = GM12878_GRAPH_DIR / "edge_features.npz"
 
 
 def normalize_chromosome_name(name: str) -> str:
-    """Local copy of prepare_hic_graph.py's version - trivial enough that
-    importing it would only save a few lines, and keeping it local avoids
-    any confusion about which genome build a shared helper implicitly
-    assumes."""
+   
     name = str(name).strip()
     suffix = name[3:] if name.lower().startswith("chr") else name
     if suffix.lower() == "x":
@@ -57,9 +34,7 @@ def normalize_chromosome_name(name: str) -> str:
 
 
 def build_node_index() -> tuple[pd.DataFrame, "hicstraw.HiCFile", dict[str, str]]:
-    """One row per 100kb bin across chr1-22 + chrX (hg19 lengths), in a fixed
-    global order. Also returns a {normalized_name: raw_name} map, since .hic
-    files vary in whether they store chromosomes as "chr1" or "1"."""
+    
     hic_file = hicstraw.HiCFile(str(GM12878_HIC_RAW_FILE_PATH))
 
     available_resolutions = hic_file.getResolutions()

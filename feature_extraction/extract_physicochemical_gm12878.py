@@ -1,24 +1,3 @@
-"""
-Extract per-CpG dinucleotide physicochemical codes for GM12878's
-disjoint_split - the GM12878/hg19 counterpart to
-feature_extraction/extract_physicochemical.py (HepG2/GRCh38).
-
-Uses disjoint_split only (not baseline_split): matches the choice already
-made for the sequence/graph branch sanity checks - baseline_split's
-single-chromosome train (chr1) is fine for the eventual literature-
-comparable full-model run, but disjoint_split is what every other
-standalone-branch diagnostic in this project has used so far, and physchem
-codes are cheap enough to also extract for baseline_split later if needed.
-
-Reuses load_physicochemical_properties_di/encode_sequences_to_codes from
-extract_physicochemical.py unchanged (both genome-agnostic: operate on
-whatever sequence strings/property table they're given).
-
-Usage (no arguments needed, after preprocess_gm12878.py):
-
-    python feature_extraction/extract_physicochemical_gm12878.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -30,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pyarrow.parquet as pq
 
+from config.data_config.gm12878_config import GM12878_DATA_DIR
 from config.project_config import PHYSICOCHEMICAL_PROPERTY_FILE, PHYSICOCHEMICAL_SHARD_SIZE, SEQUENCE_LENGTH
 from feature_extraction.extract_physicochemical import (
     dinucleotide_codes,
@@ -37,7 +17,6 @@ from feature_extraction.extract_physicochemical import (
     load_physicochemical_properties_di,
     UNKNOWN_DINUCLEOTIDE_CODE,
 )
-from preprocessing.download_data_gm12878 import GM12878_DATA_DIR
 
 SPLIT_NAMES = ("train", "validation", "test")
 DATASET_DIR_GM12878 = GM12878_DATA_DIR / "proceed" / "disjoint_split"

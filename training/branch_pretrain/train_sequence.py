@@ -1,34 +1,3 @@
-"""
-Pretrain the sequence branch (DanQ_Sequence) alone, on the full train/
-validation split, and save just its weights - not the whole model.
-
-This mirrors what the original ncVarPred paper did: "part of the models
-were warm-started with DNA sequence encoders (CNN or CNN/RNN) initialized
-at the values from pretrained sequence-only models (DeepSEA or DanQ)"
-(Tan & Shen, Bioinformatics 2023) - rather than training the sequence
-branch from random weights jointly with the graph/physicochemical
-branches in one shot, they trained it standalone first and used that as
-the starting point for the full model. The idea: a sequence-only model
-converges to a reasonable, already-somewhat-generalized set of weights
-on its own; starting the joint 3-branch run from there (instead of
-random init) means less "fresh memorizing" is needed during joint
-training - directly relevant to the overfitting we've been seeing.
-
-This is a *warm start*, not a frozen/fixed branch: training/train.py
-loads this checkpoint's weights into model.sequence_branch and then
-continues to fine-tune it jointly with the other two branches as normal.
-
-IMPORTANT: USE_SELF_ATTENTION below must match whatever
-use_sequence_self_attention value training/train.py's DeepMethModel
-construction uses - the saved state_dict's shapes depend on which
-internal architecture (BiLSTM vs self-attention) was used, and loading
-into a mismatched architecture will fail.
-
-Usage (no arguments needed):
-
-    python training/pretrain_sequence.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -36,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import numpy as np
 import torch
@@ -51,48 +20,38 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 
 from config.project_config import (
-    CHECKPOINT_DIR,
+    ACTIVE_CHECKPOINT_DIR,
+    ACTIVE_EARLY_STOPPING_PATIENCE,
+    ACTIVE_EPOCHS,
+    ACTIVE_LEARNING_RATE,
+    ACTIVE_RESULTS_DIR,
+    ACTIVE_WEIGHT_DECAY,
     DEVICE,
     EARLY_STOPPING_MIN_DELTA,
-    EARLY_STOPPING_PATIENCE,
-    EPOCHS,
     FUSION_DROPOUT,
     FUSION_HIDDEN_DIM,
-    LEARNING_RATE,
     LOG_INTERVAL_SECONDS,
-    RESULTS_DIR,
     SEQUENCE_BRANCH_OUTPUT_DIM,
     TRAINING_SEED,
-    USE_SEQUENCE_SELF_ATTENTION,
-    WEIGHT_DECAY,
 )
 from model.sequence_branch import DanQ_Sequence
 from training.train import build_loader, resolve_pos_weight, set_seed
 
-# Re-exported under this file's original name for anything still importing
-# it from here - the actual value lives in config.project_config now (both
-# this file and training/train.py import it from there, which is what
-# actually keeps them in sync; importing it from each other would be
-# circular).
-USE_SELF_ATTENTION = USE_SEQUENCE_SELF_ATTENTION
-
-CHECKPOINT_SUBDIR = CHECKPOINT_DIR / "sequence_pretrain"
+# Sibling of the full model's own checkpoint dir - same "sequence_only" name
+# training/train.py's ACTIVE_SEQUENCE_ONLY_CHECKPOINT_PATH expects.
+CHECKPOINT_SUBDIR = ACTIVE_CHECKPOINT_DIR.parent / "sequence_only"
 LAST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "last_checkpoint.pt"
 BEST_CHECKPOINT_PATH = CHECKPOINT_SUBDIR / "best_model.pt"
 
-# What training/train.py actually loads for warm-start - just the
-# sequence_branch weights, not the head/optimizer/etc.
-SEQUENCE_BRANCH_WEIGHTS_PATH = CHECKPOINT_DIR / "sequence_branch_pretrained.pt"
-
-HISTORY_PATH = RESULTS_DIR / "training_history_sequence_pretrain.json"
+HISTORY_PATH = ACTIVE_RESULTS_DIR / "training_history_sequence_pretrain.json"
 
 
 class SequenceOnlyModel(nn.Module):
     """Sequence branch + a small linear head, for standalone pretraining only."""
 
-    def __init__(self, use_self_attention: bool, head_hidden_dim: int, head_dropout_prob: float):
+    def __init__(self, head_hidden_dim: int, head_dropout_prob: float):
         super().__init__()
-        self.sequence_branch = DanQ_Sequence(use_self_attention=use_self_attention)
+        self.sequence_branch = DanQ_Sequence()
         self.head = nn.Sequential(
             nn.Linear(SEQUENCE_BRANCH_OUTPUT_DIM, head_hidden_dim),
             nn.ReLU(),
@@ -181,11 +140,11 @@ def main() -> None:
     set_seed(TRAINING_SEED)
 
     CHECKPOINT_SUBDIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Pretraining sequence branch alone (use_self_attention={USE_SELF_ATTENTION})")
+    print("Pretraining sequence branch alone")
 
     print("\n[1/3] Building datasets")
     train_dataset, train_loader = build_loader("train", shuffle=True)
@@ -196,12 +155,11 @@ def main() -> None:
 
     print("\n[2/3] Building model")
     model = SequenceOnlyModel(
-        use_self_attention=USE_SELF_ATTENTION,
         head_hidden_dim=FUSION_HIDDEN_DIM,
         head_dropout_prob=FUSION_DROPOUT,
     ).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.Adam(model.parameters(), lr=ACTIVE_LEARNING_RATE, weight_decay=ACTIVE_WEIGHT_DECAY)
 
     start_epoch = 0
     best_validation_loss = float("inf")
@@ -219,7 +177,7 @@ def main() -> None:
         history = checkpoint["history"]
 
     print("\n[3/3] Training")
-    for epoch in range(start_epoch, EPOCHS):
+    for epoch in range(start_epoch, ACTIVE_EPOCHS):
         epoch_start = time.time()
 
         train_dataset.set_epoch(epoch)
@@ -231,7 +189,7 @@ def main() -> None:
         epoch_duration = time.time() - epoch_start
 
         print(
-            f"Epoch {epoch + 1}/{EPOCHS} ({epoch_duration:.1f}s) | "
+            f"Epoch {epoch + 1}/{ACTIVE_EPOCHS} ({epoch_duration:.1f}s) | "
             f"train_loss={train_metrics['loss']:.4f} | val_loss={validation_metrics['loss']:.4f} | "
             f"val_balanced_acc={validation_metrics['balanced_accuracy']:.4f} | "
             f"val_mcc={validation_metrics['mcc']:.4f} | val_auc={validation_metrics['roc_auc']:.4f}"
@@ -248,11 +206,7 @@ def main() -> None:
                 {"epoch": epoch, "model_state_dict": model.state_dict(), "validation_metrics": validation_metrics},
                 BEST_CHECKPOINT_PATH,
             )
-            # This is the file training/train.py actually consumes for warm-start -
-            # only the sequence_branch sub-module's weights, saved fresh every time
-            # a new best is found.
-            torch.save(model.sequence_branch.state_dict(), SEQUENCE_BRANCH_WEIGHTS_PATH)
-            print(f"  New best validation loss: {best_validation_loss:.4f} -> saved {SEQUENCE_BRANCH_WEIGHTS_PATH}")
+            print(f"  New best validation loss: {best_validation_loss:.4f} -> saved {BEST_CHECKPOINT_PATH}")
         else:
             patience_counter += 1
 
@@ -271,13 +225,13 @@ def main() -> None:
         with HISTORY_PATH.open("w", encoding="utf-8") as file:
             json.dump(history, file, indent=2)
 
-        if patience_counter >= EARLY_STOPPING_PATIENCE:
-            print(f"\nEarly stopping: no improvement for {EARLY_STOPPING_PATIENCE} epochs.")
+        if patience_counter >= ACTIVE_EARLY_STOPPING_PATIENCE:
+            print(f"\nEarly stopping: no improvement for {ACTIVE_EARLY_STOPPING_PATIENCE} epochs.")
             break
 
     print("\nSequence pretraining completed.")
     print(f"Best validation loss: {best_validation_loss:.4f}")
-    print(f"Sequence branch weights for warm-start: {SEQUENCE_BRANCH_WEIGHTS_PATH}")
+    print(f"Best checkpoint (what train.py's warm-start reads): {BEST_CHECKPOINT_PATH}")
 
 
 if __name__ == "__main__":

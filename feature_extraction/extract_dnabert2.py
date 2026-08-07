@@ -1,24 +1,3 @@
-"""
-Create DNABERT-2 node features for the Hi-C graph.
-
-CpGs from train+validation+test are combined (chromosome-disjoint splits
-already prevent leakage - a node's chromosome belongs to exactly one split,
-and DNABERT-2 embeddings are frozen/unsupervised, so there is no label
-information to leak). Using train CpGs only would leave every node on a
-validation/test chromosome with zero contributing CpGs, since those
-chromosomes never appear in the train split at all.
-
-CpGs are mapped to 100-kb genomic nodes. At most a fixed number of CpGs is
-selected deterministically from each node. Their frozen DNABERT-2
-embeddings are mean-pooled to produce one 768-dimensional feature vector
-per node. Output is one file per chromosome, so an interrupted run can
-just be re-run - completed chromosomes are skipped.
-
-Usage (no arguments needed):
-
-    python feature_extraction/extract_dnabert2.py
-"""
-
 from __future__ import annotations
 
 import json
@@ -69,11 +48,7 @@ def load_frozen_model(device: torch.device):
     config.output_attentions = False
     config.return_dict = True
 
-    # Avoid DNABERT-2's custom Triton flash-attention kernel, which needs
-    # more shared memory than some GPUs (e.g. T4) provide. Forcing a
-    # nonzero dropout routes the model through its plain PyTorch attention
-    # path instead. Harmless: the model runs in eval()/inference_mode(),
-    # where nn.Dropout is always a no-op regardless of its probability.
+   
     config.attention_probs_dropout_prob = 0.1
 
     model = AutoModel.from_pretrained(
@@ -82,17 +57,7 @@ def load_frozen_model(device: torch.device):
         config=config,
         trust_remote_code=True,
         low_cpu_mem_usage=False,
-        # Newer transformers versions decoupled "fast init" (constructs
-        # parameters on a torch.device("meta") placeholder, then materializes
-        # them from the checkpoint) from low_cpu_mem_usage - it now defaults
-        # to True regardless. DNABERT-2's own bert_layers.py isn't meta-
-        # device-aware: BertEncoder.__init__ eagerly computes a real ALiBi
-        # bias tensor on CPU during construction, before the meta-initialized
-        # parameters are materialized, so the two end up on different
-        # devices ("Tensor on device meta is not on the expected device
-        # cpu!"). _fast_init=False forces plain eager (CPU) construction,
-        # side-stepping the mismatch - this repo's own model/*.py modules
-        # aren't affected (they're not loaded via from_pretrained).
+    
         _fast_init=False,
     )
 
@@ -123,7 +88,7 @@ def find_all_chromosomes() -> list[str]:
 
     for split_name, path in SPLIT_PATHS.items():
         if not path.exists():
-            raise FileNotFoundError(f"{path} does not exist. Run preprocessing/preprocess.py first.")
+            raise FileNotFoundError(f"{path} does not exist. Run preprocessing/preprocess_hepg2.py first.")
 
         parquet_file = pq.ParquetFile(path)
         for batch in parquet_file.iter_batches(batch_size=1_000_000, columns=["chrom"]):
@@ -157,7 +122,7 @@ def load_chromosome(chromosome: str) -> pd.DataFrame:
 
 
 def select_cpgs_per_node(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """Select CpGs deterministically and approximately evenly across every 100-kb node."""
+    """Select CpGs deterministically and approximately evenly across every GRAPH_RESOLUTION-bp node."""
     bin_starts = dataframe["bin_start"].to_numpy(dtype=np.int64)
 
     unique_bins, first_indices, counts = np.unique(bin_starts, return_index=True, return_counts=True)
@@ -296,7 +261,7 @@ def process_chromosome(chromosome: str, tokenizer, model, device: torch.device, 
 def main() -> None:
     for path in SPLIT_PATHS.values():
         if not path.exists():
-            raise FileNotFoundError(f"{path} does not exist. Run preprocessing/preprocess.py first.")
+            raise FileNotFoundError(f"{path} does not exist. Run preprocessing/preprocess_hepg2.py first.")
 
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA GPU is required.")
@@ -335,7 +300,7 @@ def main() -> None:
         "model_name": DNABERT_MODEL_NAME,
         "model_revision": DNABERT_MODEL_REVISION,
         "frozen": True,
-        "pooling": "masked_mean_per_sequence_then_mean_per_100kb_node",
+        "pooling": "masked_mean_per_sequence_then_mean_per_node",
         "source_splits": SPLIT_NAMES,
         "graph_resolution": GRAPH_RESOLUTION,
         "max_cpg_per_node": DNABERT_MAX_CPG_PER_NODE,

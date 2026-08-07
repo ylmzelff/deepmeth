@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 
+from config.project_config import (
+    GRAPH_BRANCH_OUTPUT_DIM,
+    PHYSICOCHEMICAL_CNN_OUTPUT_DIM,
+    SEQUENCE_BRANCH_OUTPUT_DIM,
+)
 from model.sequence_branch import DanQ_Sequence
 from model.graph_branch_gat import GATv2Structure
 from model.graph_readout import CpGAwareGraphReadout
@@ -50,27 +55,21 @@ class DeepMethModel(nn.Module):
         fusion_projected_dim: int,
         fusion_hidden_dim: int,
         fusion_dropout_prob: float,
-        use_sequence_self_attention: bool = False,
         use_physchem_property_gate: bool = False,
         graph_readout_dropout_prob: float = 0.2,
     ):
         super(DeepMethModel, self).__init__()
 
-        # ncVarPred DanQ-based sequence branch. use_sequence_self_attention
-        # swaps the BiLSTM for a lightweight Transformer encoder over the
-        # same 36 CNN positions - see model/sequence_branch.py. Default
-        # False reproduces the original DanQ path unchanged.
-        self.sequence_branch = DanQ_Sequence(
-            use_self_attention=use_sequence_self_attention
-        )
+        # ncVarPred DanQ-based sequence branch - see model/sequence_branch.py.
+        self.sequence_branch = DanQ_Sequence()
 
         # GATv2-based structure branch (see model/graph_branch_gat.py) +
         # CpG-aware readout (see model/graph_readout.py) - together replace
         # the original GCN_Structure.
         self.structure_branch = GATv2Structure()
         self.graph_readout = CpGAwareGraphReadout(
-            graph_dim=128,
-            sequence_dim=925,
+            graph_dim=GRAPH_BRANCH_OUTPUT_DIM,
+            sequence_dim=SEQUENCE_BRANCH_OUTPUT_DIM,
             dropout_prob=graph_readout_dropout_prob,
         )
 
@@ -83,14 +82,10 @@ class DeepMethModel(nn.Module):
         )
 
         # Gated fusion head instead of concatenation + one linear layer.
-        #
-        # Sequence:        925
-        # Structure:       128
-        # Physicochemical: 480
         self.fusion = GatedFusion(
-            sequence_dim=925,
-            graph_dim=128,
-            physchem_dim=480,
+            sequence_dim=SEQUENCE_BRANCH_OUTPUT_DIM,
+            graph_dim=GRAPH_BRANCH_OUTPUT_DIM,
+            physchem_dim=PHYSICOCHEMICAL_CNN_OUTPUT_DIM,
             projected_dim=fusion_projected_dim,
             hidden_dim=fusion_hidden_dim,
             dropout_prob=fusion_dropout_prob,
@@ -140,9 +135,7 @@ class DeepMethModel(nn.Module):
         """
 
         # [B, 4, 501] -> [B, 925]
-        seq_output = self.sequence_branch(
-            seq_input
-        )
+        seq_output = self.sequence_branch(seq_input)
 
         # [N, NODE_FEATURE_DIM], [2, E], [E, 4], [B] -> [B, 128]
         raw_structure_output = self.structure_branch(
@@ -156,9 +149,7 @@ class DeepMethModel(nn.Module):
         structure_output = self.graph_readout(raw_structure_output, seq_output)
 
         # [B, 12, 500] -> [B, 480]
-        physchem_output = self.physchem_branch(
-            physchem_input
-        )
+        physchem_output = self.physchem_branch(physchem_input)
 
         # Gated fusion: [B, 925] + [B, 128] + [B, 480] -> [B, 1]
         output = self.fusion(
