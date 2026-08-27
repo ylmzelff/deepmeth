@@ -40,6 +40,9 @@ HG19_2BIT_PATH = GM12878_REFERENCE_DIR / "hg19.2bit"
 ACTIVE_DATA_DIR = GM12878_DATA_DIR
 ACTIVE_SEQUENCE_CODES_DIR = GM12878_DATA_DIR / "sequence_codes"
 ACTIVE_PHYSICOCHEMICAL_DIR = GM12878_DATA_DIR / "physicochemical"
+# feature_extraction/extract_dnabert2_tokens_gm12878.py's output dir - per-CpG,
+# token-level (not pooled) DNABERT-2 features for model/foundation_branch.py.
+ACTIVE_FOUNDATION_TOKEN_DIR = GM12878_DATA_DIR / "dnabert2_token_features"
 ACTIVE_GRAPH_DIR = GM12878_DATA_DIR / "graph"
 ACTIVE_SPLIT_NODE_INDEX_DIR = GM12878_DATA_DIR / "proceed" / "disjoint_split"
 

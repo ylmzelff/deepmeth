@@ -73,6 +73,15 @@ DNABERT_SAVE_DTYPE = "float16"
 DNABERT_TOKENIZER_MAX_LENGTH = 512
 DNABERT_MAX_CPG_PER_NODE = 64
 
+# Fixed padding target for the foundation branch's per-CpG token embeddings
+# (feature_extraction/extract_dnabert2_tokens_gm12878.py, model/foundation_branch.py).
+# Measured real token counts for 501bp CpG windows: min 89, max 120, mean ~109
+# across a 5,000-sequence sample - 128 covers the observed range with headroom.
+# Fixed (not per-shard-dynamic) so every stored shard has identical shape and
+# downstream loading needs no ragged-array handling; attention_mask still
+# carries each row's real length for masking.
+FOUNDATION_TOKEN_MAX_LENGTH = 128
+
 # ============================================================
 # Model architecture dimensions (fixed — ported as-is, do not change)
 # ============================================================
@@ -82,7 +91,7 @@ GRAPH_BRANCH_OUTPUT_DIM = 128
 FOUNDATION_BRANCH_OUTPUT_DIM = 256
 FUSION_INPUT_DIM = (
     SEQUENCE_BRANCH_OUTPUT_DIM
-    + GRAPH_BRANCH_OUTPUT_DIM
+    + FOUNDATION_BRANCH_OUTPUT_DIM
     + PHYSICOCHEMICAL_CNN_OUTPUT_DIM
 )
 
@@ -124,6 +133,7 @@ _ACTIVE_NAMES = frozenset({
     "ACTIVE_DATA_DIR",
     "ACTIVE_SEQUENCE_CODES_DIR",
     "ACTIVE_PHYSICOCHEMICAL_DIR",
+    "ACTIVE_FOUNDATION_TOKEN_DIR",
     "ACTIVE_GRAPH_DIR",
     "ACTIVE_SPLIT_NODE_INDEX_DIR",
     "ACTIVE_CHECKPOINT_DIR",
